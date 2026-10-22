@@ -1,429 +1,322 @@
-import hashlib
-import hmac
-import io
-import os
-import re
-import secrets
-import sqlite3
-from datetime import datetime
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from db import (
+    init_db, get_conn, authenticate, create_user, list_users, set_user_active,
+    list_master, add_master, bulk_add_master, update_master, list_inventory, preview_variants,
+    save_inventory_variants, update_inventory, get_inventory_by_id, audit_rows,
+    change_password, admin_count, deactivate_master
+)
+from sku import generate_sku, colour_code
+from urllib.parse import urlparse
 
-APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "inventory.db"
-MASTER_TABLES = {
-    "Category": {"table": "categories", "code_col": "category_code", "name_col": "category_name"},
-    "Brand": {"table": "brands", "code_col": "brand_code", "name_col": "brand_name"},
-    "Colour": {"table": "colours", "code_col": "colour_code", "name_col": "colour_name"},
-    "Grade": {"table": "grades", "code_col": "grade_code", "name_col": "grade_name"},
-}
-PBKDF2_ITERATIONS = 310_000
-
-
-def now_iso():
-    return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def hash_password(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), PBKDF2_ITERATIONS).hex()
-    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt}${digest}"
-
-
-def verify_password(password, stored):
-    try:
-        algorithm, iterations, salt, expected = stored.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iterations)).hex()
-        return hmac.compare_digest(actual, expected)
-    except (ValueError, TypeError):
-        return False
-
-
-def add_column_if_missing(conn, table, column, definition):
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def init_db():
-    with connect() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('admin', 'user')),
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            category_code TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL DEFAULT 'system'
-        );
-        CREATE TABLE IF NOT EXISTS brands (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            brand_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            brand_code TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL DEFAULT 'system'
-        );
-        CREATE TABLE IF NOT EXISTS colours (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            colour_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            colour_code TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL DEFAULT 'system'
-        );
-        CREATE TABLE IF NOT EXISTS grades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            grade_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            grade_code TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL DEFAULT 'system'
-        );
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT NOT NULL,
-            model_name TEXT NOT NULL,
-            category_id INTEGER NOT NULL,
-            brand_id INTEGER NOT NULL,
-            grade_id INTEGER NOT NULL,
-            colour_id INTEGER NOT NULL,
-            mrp REAL NOT NULL CHECK(mrp >= 0),
-            purchase_price REAL NOT NULL CHECK(purchase_price >= 0),
-            selling_price REAL NOT NULL CHECK(selling_price >= 0),
-            source_url TEXT,
-            sku TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL DEFAULT 'system',
-            FOREIGN KEY(category_id) REFERENCES categories(id),
-            FOREIGN KEY(brand_id) REFERENCES brands(id),
-            FOREIGN KEY(grade_id) REFERENCES grades(id),
-            FOREIGN KEY(colour_id) REFERENCES colours(id)
-        );
-        """)
-        # Migrate databases created by earlier versions of this app.
-        for table in ("categories", "brands", "colours", "grades"):
-            add_column_if_missing(conn, table, "created_by", "TEXT NOT NULL DEFAULT 'system'")
-        add_column_if_missing(conn, "inventory", "source_url", "TEXT")
-        add_column_if_missing(conn, "inventory", "created_by", "TEXT NOT NULL DEFAULT 'system'")
-        add_column_if_missing(conn, "inventory", "created_at", "TEXT NOT NULL DEFAULT ''")
-        add_column_if_missing(conn, "users", "created_at", "TEXT NOT NULL DEFAULT ''")
-        add_column_if_missing(conn, "users", "created_by", "TEXT NOT NULL DEFAULT 'system'")
-        # A product can have multiple colours. Keep colour_id for compatibility with
-        # older databases and store all selected colours in this relation table.
-        conn.execute("""CREATE TABLE IF NOT EXISTS inventory_colours (
-            inventory_id INTEGER NOT NULL,
-            colour_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL,
-            PRIMARY KEY (inventory_id, colour_id),
-            FOREIGN KEY(inventory_id) REFERENCES inventory(id) ON DELETE CASCADE,
-            FOREIGN KEY(colour_id) REFERENCES colours(id)
-        )""")
-        # Backfill the original single colour for products created by earlier versions.
-        conn.execute("""INSERT OR IGNORE INTO inventory_colours (inventory_id, colour_id, created_at, created_by)
-            SELECT id, colour_id, created_at, created_by FROM inventory""")
-
-
-def clean_code(code):
-    return re.sub(r"[^A-Za-z0-9_-]", "", str(code).strip()).upper()
-
-
-def model_abbreviation(model_name):
-    words = re.findall(r"[A-Za-z0-9]+", model_name.upper())
-    if not words:
-        return ""
-    if len(words) == 1:
-        return words[0][:8]
-    return "".join(w[:2] for w in words)[:10]
-
-
-def make_sku(category_code, brand_code, model_name, colour_codes, grade_code):
-    # Multiple colours are represented in the colour SKU segment, joined with '+'.
-    if isinstance(colour_codes, str):
-        colour_codes = [colour_codes]
-    # colour_segment = "+".join(clean_code(code) for code in colour_codes)
-    sorted_colours = sorted(selected_colours, key=lambda c: c["name"].casefold())
-
-    combined_colour_code = "".join(
-        colour["code"].replace(" ", "").upper()
-        for colour in sorted_colours
-    )
-    return "-".join([clean_code(category_code), clean_code(brand_code), model_abbreviation(model_name), combined_colour_code, clean_code(grade_code)])
-
-
-def get_master_options(master_key):
-    meta = MASTER_TABLES[master_key]
-    with connect() as conn:
-        rows = conn.execute(f"SELECT id, {meta['name_col']} AS name, {meta['code_col']} AS code FROM {meta['table']} ORDER BY {meta['name_col']}").fetchall()
-    return [dict(r) for r in rows]
-
-
-def add_master(master_key, name, code, username):
-    meta = MASTER_TABLES[master_key]
-    name = str(name).strip()
-    code = clean_code(code)
-    if not name or not code:
-        raise ValueError("Both name and code are required.")
-    if not re.fullmatch(r"[A-Z0-9_-]+", code):
-        raise ValueError("Code may contain only letters, numbers, hyphens, and underscores.")
-    with connect() as conn:
-        conn.execute(f"INSERT INTO {meta['table']} ({meta['name_col']}, {meta['code_col']}, created_at, created_by) VALUES (?, ?, ?, ?)", (name, code, now_iso(), username))
-
-
-def add_user(username, password, role, created_by):
-    username = username.strip()
-    if len(username) < 3:
-        raise ValueError("Username must contain at least 3 characters.")
-    if len(password) < 5:
-        raise ValueError("Password must contain at least 5 characters.")
-    if role not in ("admin", "user"):
-        raise ValueError("Invalid role.")
-    with connect() as conn:
-        conn.execute("INSERT INTO users (username, password_hash, role, created_at, created_by) VALUES (?, ?, ?, ?, ?)", (username, hash_password(password), role, now_iso(), created_by))
-
-
-def fetch_inventory(search=""):
-    query = '''SELECT i.id, i.item_name AS "Item Name", i.model_name AS "Model Name",
-        c.category_name AS "Item Category", b.brand_name AS Brand, g.grade_name AS Grade,
-        COALESCE((SELECT GROUP_CONCAT(co.colour_name, ', ')
-            FROM inventory_colours ic JOIN colours co ON co.id=ic.colour_id
-            WHERE ic.inventory_id=i.id), (SELECT colour_name FROM colours WHERE id=i.colour_id)) AS Colour,
-        i.mrp AS MRP, i.purchase_price AS "Purchase Price",
-        i.selling_price AS "Selling Price", i.source_url AS "Source URL", i.sku AS SKU,
-        i.created_at AS created_at, i.created_by AS created_by
-        FROM inventory i JOIN categories c ON c.id=i.category_id
-        JOIN brands b ON b.id=i.brand_id JOIN grades g ON g.id=i.grade_id'''
-    params = ()
-    if search.strip():
-        query += " WHERE i.item_name LIKE ? OR i.model_name LIKE ? OR i.sku LIKE ? OR c.category_name LIKE ? OR b.brand_name LIKE ?"
-        term = f"%{search.strip()}%"
-        params = (term, term, term, term, term)
-    query += " ORDER BY i.id DESC"
-    with connect() as conn:
-        return pd.read_sql_query(query, conn, params=params)
-
-
-def add_inventory(values, colour_ids):
-    with connect() as conn:
-        cur = conn.execute("""INSERT INTO inventory (item_name, model_name, category_id, brand_id, grade_id, colour_id,
-        mrp, purchase_price, selling_price, source_url, sku, created_at, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values)
-        inventory_id = cur.lastrowid
-        for colour_id in colour_ids:
-            conn.execute("INSERT INTO inventory_colours (inventory_id, colour_id, created_at, created_by) VALUES (?, ?, ?, ?)",
-                         (inventory_id, colour_id, now_iso(), values[-1]))
-
-
-def add_bulk_master_csv(master_key, uploaded_file, username):
-    df = pd.read_csv(uploaded_file, dtype=str).fillna("")
-    normalized = {str(c).strip().lower(): c for c in df.columns}
-    name_col = next((normalized[k] for k in ("name", "category_name", "brand_name", "colour_name", "color_name", "grade_name") if k in normalized), None)
-    code_col = next((normalized[k] for k in ("code", "category_code", "brand_code", "colour_code", "color_code", "grade_code") if k in normalized), None)
-    if not name_col or not code_col:
-        raise ValueError("CSV must contain Name and Code columns (or the matching master-specific column names).")
-    added, errors = 0, []
-    for idx, row in df.iterrows():
-        try:
-            add_master(master_key, row[name_col], row[code_col], username)
-            added += 1
-        except (ValueError, sqlite3.IntegrityError) as exc:
-            errors.append(f"Row {idx + 2}: {exc}")
-    return added, errors
-
-
-st.set_page_config(page_title="Inventory Entry Tool", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Inventory & SKU Manager", page_icon="📦", layout="wide")
 init_db()
-st.title("📦 Inventory Entry Tool")
-st.caption("Secure inventory entry, role-based access, dropdown management, and SQLite storage.")
 
-# First-run setup: no shared/default password is created. The first account becomes admin.
-with connect() as conn:
-    user_count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+def rerun():
+    st.rerun()
 
-if user_count == 0:
-    st.info("First-time setup: create the initial administrator account. This screen disappears after the first admin is created.")
-    with st.form("initial_admin_form"):
-        setup_username = st.text_input("Admin username")
-        setup_password = st.text_input("Admin password", type="password", help="Use at least 10 characters.")
-        setup_confirm = st.text_input("Confirm password", type="password")
-        setup_submit = st.form_submit_button("Create Admin", type="primary")
-    if setup_submit:
-        if setup_password != setup_confirm:
-            st.error("Passwords do not match.")
+def logged_in():
+    return bool(st.session_state.get("user"))
+
+def is_admin():
+    return logged_in() and st.session_state.user["role"] == "admin"
+
+def require_admin():
+    if not is_admin():
+        st.error("You do not have permission to access this section.")
+        st.stop()
+
+def master_options(kind):
+    return list_master(kind, active_only=True)
+
+def option_labels(rows):
+    return ["Select"] + [r["name"] for r in rows]
+
+def selected_id(rows, selected_name):
+    for r in rows:
+        if r["name"] == selected_name:
+            return r["id"]
+    return None
+
+if not logged_in():
+    st.title("📦 Inventory Entry & SKU Management")
+    st.caption("Sign in to manage product variants, stock and SKU rules.")
+    with st.form("login"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in", type="primary", use_container_width=True)
+    if submitted:
+        user = authenticate(username.strip(), password)
+        if user:
+            st.session_state.user = user
+            rerun()
         else:
-            try:
-                add_user(setup_username, setup_password, "admin", "system")
-                st.success("Admin created. Please sign in.")
-                st.rerun()
-            except (ValueError, sqlite3.IntegrityError) as exc:
-                st.error(str(exc) if isinstance(exc, ValueError) else "That username already exists.")
+            st.error("Invalid username/password, or this account is inactive.")
+    st.info("First run? Create the initial administrator from your terminal: `python setup_admin.py`")
     st.stop()
 
-if "auth_user" not in st.session_state:
-    st.session_state.auth_user = None
-
-if not st.session_state.auth_user:
-    with st.sidebar:
-        st.subheader("Sign in")
-        with st.form("login_form"):
-            login_username = st.text_input("Username")
-            login_password = st.text_input("Password", type="password")
-            login_submit = st.form_submit_button("Login", type="primary", use_container_width=True)
-        if login_submit:
-            with connect() as conn:
-                user = conn.execute("SELECT username, password_hash, role FROM users WHERE username = ? COLLATE NOCASE", (login_username.strip(),)).fetchone()
-            if user and verify_password(login_password, user["password_hash"]):
-                st.session_state.auth_user = {"username": user["username"], "role": user["role"]}
-                st.rerun()
-            else:
-                st.error("Invalid username or password.")
-    st.title("Please sign in to continue")
-    st.stop()
-
-current_user = st.session_state.auth_user
-is_admin = current_user["role"] == "admin"
+user = st.session_state.user
 with st.sidebar:
-    st.success(f"Signed in: {current_user['username']} ({current_user['role']})")
+    st.title("📦 Inventory")
+    st.write(f"Signed in as **{user['username']}**")
+    st.caption(f"Role: {user['role'].title()}")
+    pages = ["Dashboard", "Inventory", "Add Inventory"]
+    if is_admin():
+        pages += ["Manage", "User Management", "Audit History"]
+    page = st.radio("Navigation", pages, label_visibility="collapsed")
     if st.button("Log out", use_container_width=True):
-        st.session_state.auth_user = None
-        st.rerun()
+        st.session_state.pop("user", None)
+        rerun()
 
-pages = ["➕ Add Product", "📋 Inventory"]
-if is_admin:
-    pages += ["⚙️ Manage Dropdowns", "👥 Manage Users"]
-page = st.radio("Navigation", pages, horizontal=True, label_visibility="collapsed")
-
-if page == "➕ Add Product":
-    st.subheader("Product details")
-    categories, brands = get_master_options("Category"), get_master_options("Brand")
-    colours, grades = get_master_options("Colour"), get_master_options("Grade")
-    if not all([categories, brands, colours, grades]):
-        st.warning("An administrator must add at least one Category, Brand, Colour, and Grade before products can be entered.")
+if page == "Dashboard":
+    st.title("Dashboard")
+    inv = list_inventory()
+    df = pd.DataFrame(inv)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Inventory records", len(df))
+    c2.metric("Total units", int(df["quantity"].sum()) if not df.empty else 0)
+    c3.metric("Unique SKUs", df["sku"].nunique() if not df.empty else 0)
+    c4.metric("Zero-stock records", int((df["quantity"] == 0).sum()) if not df.empty else 0)
+    st.subheader("Recently updated inventory")
+    if df.empty:
+        st.info("No inventory yet. Use Add Inventory to create your first item.")
     else:
-        with st.form("product_form", clear_on_submit=True):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                item_name = st.text_input("Item Name *")
-                model_name = st.text_input("Model Name *")
-                category = st.selectbox("Item Category *", [None] + categories, format_func=lambda x: "Select category" if x is None else f"{x['name']} ({x['code']})")
-            with col2:
-                brand = st.selectbox("Brand *", [None] + brands, format_func=lambda x: "Select brand" if x is None else f"{x['name']} ({x['code']})")
-                selected_colours = st.multiselect("Colour(s) *", colours, format_func=lambda x: f"{x['name']} ({x['code']})", help="Select one or more colours for this product.")
-                grade = st.selectbox("Grade *", [None] + grades, format_func=lambda x: "Select grade" if x is None else f"{x['name']} ({x['code']})")
-            with col3:
-                mrp = st.number_input("MRP *", min_value=0.0, step=1.0, format="%.2f")
-                purchase_price = st.number_input("Purchase Price *", min_value=0.0, step=1.0, format="%.2f")
-                selling_price = st.number_input("Selling Price *", min_value=0.0, step=1.0, format="%.2f")
-            source_url = st.text_input("Source URL (optional)", placeholder="https://...")
-            colour_codes = [c["code"] for c in selected_colours]
-            sku = make_sku(category["code"], brand["code"], model_name, colour_codes, grade["code"]) if all([category, brand, grade]) and selected_colours and model_name.strip() else ""
-            st.text_input("Generated SKU", value=sku, disabled=True)
-            submitted = st.form_submit_button("Save Product", type="primary", use_container_width=True)
-        if submitted:
-            if not item_name.strip() or not model_name.strip() or not all([category, brand, grade]) or not selected_colours:
-                st.error("Complete all required fields and select at least one colour.")
-            elif source_url.strip() and not re.match(r"^https?://", source_url.strip(), re.I):
-                st.error("Source URL must start with http:// or https://, or be left empty.")
-            else:
-                try:
-                    add_inventory((item_name.strip(), model_name.strip(), category["id"], brand["id"], grade["id"], selected_colours[0]["id"], float(mrp), float(purchase_price), float(selling_price), source_url.strip() or None, sku, now_iso(), current_user["username"]), [c["id"] for c in selected_colours])
-                    st.success(f"Product saved. SKU: {sku}")
-                except sqlite3.IntegrityError as exc:
-                    if "unique" in str(exc).lower():
-                        st.error(f"SKU already exists: {sku}. Adjust the model name or master codes.")
+        st.dataframe(df.sort_values("updated_at", ascending=False).head(10), use_container_width=True, hide_index=True)
+
+elif page == "Inventory":
+    st.title("Inventory")
+    inv = list_inventory()
+    df = pd.DataFrame(inv)
+    if df.empty:
+        st.info("No inventory records found.")
+    else:
+        search = st.text_input("Search by SKU, item or model")
+        cols = st.columns(4)
+        category = cols[0].selectbox("Category", ["All"] + sorted(df["category"].dropna().unique().tolist()))
+        brand = cols[1].selectbox("Brand", ["All"] + sorted(df["brand"].dropna().unique().tolist()))
+        grade = cols[2].selectbox("Grade", ["All"] + sorted(df["grade"].dropna().unique().tolist()))
+        colour = cols[3].selectbox("Colour code", ["All"] + sorted(df["colour_code"].dropna().unique().tolist()))
+        filtered = df.copy()
+        if search:
+            mask = filtered[["sku", "item_name", "model_name"]].fillna("").astype(str).apply(
+                lambda col: col.str.contains(search, case=False, regex=False)).any(axis=1)
+            filtered = filtered[mask]
+        for col, val in [("category", category), ("brand", brand), ("grade", grade), ("colour_code", colour)]:
+            if val != "All":
+                filtered = filtered[filtered[col] == val]
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+        if is_admin():
+            st.subheader("Edit inventory record")
+            choices = {f"{r['sku']} — {r['item_name']} (ID {r['id']})": r["id"] for r in inv}
+            choice = st.selectbox("Select record", ["Select"] + list(choices.keys()))
+            if choice != "Select":
+                row = get_inventory_by_id(choices[choice])
+                with st.form("edit_inventory"):
+                    item_name = st.text_input("Item name", row["item_name"])
+                    model_name = st.text_input("Model name", row["model_name"] or "")
+                    quantity = st.number_input("Quantity", min_value=0, step=1, value=int(row["quantity"]))
+                    mrp = st.number_input("MRP", min_value=0.0, value=float(row["mrp"] or 0), step=1.0)
+                    purchase = st.number_input("Purchase price", min_value=0.0, value=float(row["purchase_price"] or 0), step=1.0)
+                    selling = st.number_input("Selling price", min_value=0.0, value=float(row["selling_price"] or 0), step=1.0)
+                    lot_number = st.text_input("LOT Number (optional)", row.get("lot_number") or "")
+                    source_url = st.text_input("Source URL (optional)", row["source_url"] or "")
+                    save = st.form_submit_button("Save changes", type="primary")
+                if save:
+                    if source_url and urlparse(source_url).scheme not in ("http", "https"):
+                        st.error("Source URL must start with http:// or https://")
+                    elif not item_name.strip():
+                        st.error("Item name is required.")
                     else:
-                        st.error(f"Could not save product: {exc}")
+                        try:
+                            update_inventory(row["id"], {"item_name": item_name.strip(), "model_name": model_name.strip(),
+                                "quantity": int(quantity), "mrp": mrp or None, "purchase_price": purchase or None,
+                                "selling_price": selling or None, "lot_number": lot_number.strip() or None,
+                                "source_url": source_url.strip() or None}, user)
+                            st.success("Inventory updated.")
+                            rerun()
+                        except Exception as e:
+                            st.error(str(e))
 
-elif page == "⚙️ Manage Dropdowns" and is_admin:
-    st.subheader("Manage dropdown values")
-    st.write("Add values one at a time or upload a CSV. Names and codes must both be unique. The app records creation time and user.")
-    master_choice = st.selectbox("Select section", list(MASTER_TABLES.keys()))
-    with st.form("master_form", clear_on_submit=True):
-        new_name = st.text_input(f"{master_choice} Name *")
-        new_code = st.text_input(f"{master_choice} Code *", help="Letters, numbers, hyphens, and underscores only.")
-        master_submit = st.form_submit_button(f"Add {master_choice}", type="primary")
-    if master_submit:
-        try:
-            add_master(master_choice, new_name, new_code, current_user["username"])
-            st.success(f"{master_choice} added successfully.")
-        except sqlite3.IntegrityError:
-            st.error("That name or code already exists. Use a unique value.")
-        except ValueError as exc:
-            st.error(str(exc))
-    st.divider()
-    st.subheader("Bulk upload via CSV")
-    st.caption("Required columns: Name, Code. You can also use category_name/category_code, brand_name/brand_code, colour_name/colour_code, or grade_name/grade_code.")
-    template = pd.DataFrame([{"Name": "Example Name", "Code": "EXM"}]).to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV template", template, file_name=f"{master_choice.lower()}_template.csv", mime="text/csv")
-    uploaded_csv = st.file_uploader("Upload CSV", type=["csv"], key=f"bulk_{master_choice}")
-    if uploaded_csv and st.button(f"Import {master_choice} CSV", type="primary"):
-        try:
-            added, errors = add_bulk_master_csv(master_choice, uploaded_csv, current_user["username"])
-            st.success(f"Imported {added} {master_choice.lower()} value(s).")
-            if errors:
-                st.warning(f"{len(errors)} row(s) were skipped:")
-                st.code("\n".join(errors[:50]))
-        except Exception as exc:
-            st.error(f"Could not process CSV: {exc}")
-    st.divider()
-    meta = MASTER_TABLES[master_choice]
-    with connect() as conn:
-        data = pd.read_sql_query(f"SELECT {meta['name_col']} AS Name, {meta['code_col']} AS Code, created_at, created_by FROM {meta['table']} ORDER BY id DESC", conn)
-    st.subheader(f"Existing {master_choice} values")
-    st.dataframe(data, use_container_width=True, hide_index=True)
-
-elif page == "👥 Manage Users" and is_admin:
-    st.subheader("Manage users")
-    with st.form("add_user_form", clear_on_submit=True):
-        new_username = st.text_input("Username *")
-        new_password = st.text_input("Temporary password *", type="password", help="At least 10 characters.")
-        new_password_confirm = st.text_input("Confirm password *", type="password")
-        new_role = st.selectbox("Role *", ["user", "admin"], format_func=lambda r: "User (product entry and inventory view)" if r == "user" else "Admin (all permissions)")
-        create_user_submit = st.form_submit_button("Create User", type="primary")
-    if create_user_submit:
-        if new_password != new_password_confirm:
-            st.error("Passwords do not match.")
+elif page == "Add Inventory":
+    st.title("Add Inventory")
+    st.caption("One SKU is generated for the product, combining all selected colour codes. Existing equivalent SKUs receive additional quantity.")
+    cats, brands, grades, colours = [master_options(k) for k in ("categories", "brands", "grades", "colours")]
+    if not cats or not brands:
+        st.warning("An administrator must add at least one active category and brand in Manage before inventory can be added.")
+    with st.form("add_inventory"):
+        item_name = st.text_input("Item name *")
+        model_name = st.text_input("Model name")
+        c1, c2 = st.columns(2)
+        category_name = c1.selectbox("Category *", option_labels(cats))
+        brand_name = c2.selectbox("Brand *", option_labels(brands))
+        c3, c4 = st.columns(2)
+        grade_name = c3.selectbox("Grade", option_labels(grades))
+        selected_colours = c4.multiselect("Colours", [r["name"] for r in colours])
+        quantity = st.number_input("Quantity to add for this product *", min_value=1, step=1, value=1)
+        c5, c6, c7 = st.columns(3)
+        mrp = c5.number_input("MRP", min_value=0.0, value=0.0, step=1.0)
+        purchase = c6.number_input("Purchase price", min_value=0.0, value=0.0, step=1.0)
+        selling = c7.number_input("Selling price", min_value=0.0, value=0.0, step=1.0)
+        lot_number = st.text_input("LOT Number")
+        source_url = st.text_input("Source URL (optional)")
+        preview = st.form_submit_button("Preview SKUs")
+    if preview:
+        if not item_name.strip() or category_name == "Select" or brand_name == "Select":
+            st.error("Item name, category and brand are required.")
+        if not lot_number.strip():
+            st.error("LOT Number is required.")
+        elif source_url and urlparse(source_url).scheme not in ("http", "https"):
+            st.error("Source URL must start with http:// or https://")
         else:
             try:
-                add_user(new_username, new_password, new_role, current_user["username"])
-                st.success(f"User '{new_username.strip()}' created with role '{new_role}'.")
-            except sqlite3.IntegrityError:
-                st.error("That username already exists.")
-            except ValueError as exc:
-                st.error(str(exc))
-    with connect() as conn:
-        users_df = pd.read_sql_query("SELECT username, role, created_at, created_by FROM users ORDER BY id DESC", conn)
-    st.subheader("Existing users")
-    st.dataframe(users_df, use_container_width=True, hide_index=True)
+                variants = preview_variants(item_name.strip(), model_name.strip(), selected_id(cats, category_name),
+                    selected_id(brands, brand_name), selected_id(grades, grade_name) if grade_name != "Select" else None,
+                    selected_colours, int(quantity), user)
+                st.session_state.add_preview = {"variants": variants, "item_name": item_name.strip(),
+                    "model_name": model_name.strip(), "category_id": selected_id(cats, category_name),
+                    "brand_id": selected_id(brands, brand_name),
+                    "grade_id": selected_id(grades, grade_name) if grade_name != "Select" else None,
+                    "quantity": int(quantity), "mrp": mrp or None, "purchase_price": purchase or None,
+                    "selling_price": selling or None, "lot_number": lot_number.strip() or None,
+                    "source_url": source_url.strip() or None}
+            except Exception as e:
+                st.error(str(e))
+    draft = st.session_state.get("add_preview")
+    if draft:
+        st.subheader("Review variants")
+        st.dataframe(pd.DataFrame(draft["variants"]), use_container_width=True, hide_index=True)
+        if st.button("Confirm and save inventory", type="primary"):
+            try:
+                result = save_inventory_variants(draft, user)
+                for msg in result:
+                    st.success(msg)
+                st.session_state.pop("add_preview", None)
+                rerun()
+            except Exception as e:
+                st.error(str(e))
 
-elif page == "📋 Inventory":
-    st.subheader("Saved inventory")
-    search = st.text_input("Search by item, model, SKU, category, or brand")
-    inventory_df = fetch_inventory(search)
-    if inventory_df.empty:
-        st.info("No products found. Add your first product in the Add Product section.")
+elif page == "Manage":
+    require_admin()
+    st.title("Manage master data")
+    kind_labels = {"categories": "Categories", "brands": "Brands", "grades": "Grades", "colours": "Colours", "abbreviations": "Abbreviations"}
+    kind = st.selectbox("Manage", list(kind_labels.keys()), format_func=lambda x: kind_labels[x])
+    rows = list_master(kind, active_only=False)
+    with st.expander("Add new record", expanded=True):
+        with st.form("add_master"):
+            if kind == "abbreviations":
+                original = st.text_input("Original word or phrase")
+                replacement = st.text_input("Abbreviation")
+                priority = st.number_input("Priority (higher wins ties)", min_value=0, value=0, step=1)
+                name, code = original.strip(), replacement.strip().upper()
+            else:
+                name = st.text_input("Name")
+                code = st.text_input("Code (optional; used in SKU)", placeholder="Auto-generated if blank").strip().upper()
+                priority = 0
+            add = st.form_submit_button("Add")
+        if add:
+            try:
+                if not name.strip():
+                    raise ValueError("Name is required.")
+                add_master(kind, name.strip(), code or None, int(priority), user)
+                st.success("Record added.")
+                rerun()
+            except Exception as e:
+                st.error(str(e))
+    st.subheader("Bulk import from CSV")
+    st.caption("Upload a CSV with two columns: name and code. Column names are case-insensitive (for example, Name, CODE, or NAME, Code).")
+    uploaded_csv = st.file_uploader("Choose master-data CSV", type=["csv"], key=f"master_csv_{kind}")
+    if uploaded_csv is not None:
+        try:
+            import io
+            import_csv_df = pd.read_csv(uploaded_csv, dtype=str, keep_default_na=False)
+            normalized_columns = {str(col).strip().casefold(): col for col in import_csv_df.columns}
+            if "name" not in normalized_columns or "code" not in normalized_columns:
+                st.error("CSV must contain both required columns: name and code (case-insensitive).")
+            else:
+                import_csv_df = import_csv_df.rename(columns={
+                    normalized_columns["name"]: "name",
+                    normalized_columns["code"]: "code"
+                })
+                import_csv_df = import_csv_df[["name", "code"]]
+                st.write("Preview")
+                st.dataframe(import_csv_df.head(20), use_container_width=True, hide_index=True)
+                st.caption(f"{len(import_csv_df)} row(s) found.")
+                if st.button("Import CSV rows", type="primary", key=f"import_master_csv_{kind}"):
+                    results = bulk_add_master(kind, import_csv_df.to_dict(orient="records"), user)
+                    result_df = pd.DataFrame(results)
+                    imported_count = int((result_df["status"] == "Imported").sum()) if not result_df.empty else 0
+                    skipped_count = int((result_df["status"] == "Skipped").sum()) if not result_df.empty else 0
+                    st.success(f"Import finished: {imported_count} imported, {skipped_count} skipped.")
+                    st.session_state[f"master_import_results_{kind}"] = result_df.to_dict(orient="records")
+                    rerun()
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+
+    previous_import_results = st.session_state.get(f"master_import_results_{kind}")
+    if previous_import_results:
+        st.subheader("Last CSV import results")
+        st.dataframe(pd.DataFrame(previous_import_results), use_container_width=True, hide_index=True)
+
+    st.subheader("Existing records")
+    if rows:
+        display = pd.DataFrame(rows)
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        options = {f"{r['name']} — {r.get('code') or ''} (ID {r['id']})": r for r in rows}
+        selected = st.selectbox("Select record to update/deactivate", ["Select"] + list(options.keys()))
+        if selected != "Select":
+            row = options[selected]
+            with st.form("update_master"):
+                new_name = st.text_input("Name / original phrase", row["name"])
+                new_code = st.text_input("Code / abbreviation", row.get("code") or "")
+                active = st.checkbox("Active", value=bool(row["active"]))
+                update = st.form_submit_button("Save master data")
+            if update:
+                try:
+                    update_master(kind, row["id"], new_name.strip(), new_code.strip().upper() or None, active, user)
+                    st.success("Master data updated. Existing SKUs are not changed automatically.")
+                    rerun()
+                except Exception as e:
+                    st.error(str(e))
     else:
-        st.metric("Products shown", len(inventory_df))
-        st.download_button("⬇️ Download CSV", inventory_df.to_csv(index=False).encode("utf-8-sig"), file_name="inventory.csv", mime="text/csv")
-        st.dataframe(inventory_df, use_container_width=True, hide_index=True)
+        st.info("No records configured yet.")
 
-st.sidebar.header("SKU format")
-st.sidebar.code("CATEGORY-BRAND-MODEL-COLOUR1+COLOUR2-GRADE")
-st.sidebar.caption("Select multiple colours if needed; their codes are joined with '+'. Model abbreviation: one word = first 8 characters; multiple words = first 2 characters of each word (up to 10).")
-st.sidebar.info(f"SQLite database: {DB_PATH.name}")
+elif page == "User Management":
+    require_admin()
+    st.title("User Management")
+    with st.form("create_user"):
+        username = st.text_input("Username")
+        password = st.text_input("Temporary password", type="password")
+        role = st.selectbox("Role", ["standard", "admin"])
+        submitted = st.form_submit_button("Create user", type="primary")
+    if submitted:
+        try:
+            create_user(username.strip(), password, role, user)
+            st.success("User created.")
+            rerun()
+        except Exception as e:
+            st.error(str(e))
+    st.subheader("Existing users")
+    users = list_users()
+    if users:
+        st.dataframe(pd.DataFrame(users), use_container_width=True, hide_index=True)
+        options = {f"{u['username']} ({u['role']}) — ID {u['id']}": u for u in users}
+        selected = st.selectbox("Select user to activate/deactivate", ["Select"] + list(options.keys()))
+        if selected != "Select":
+            target = options[selected]
+            desired = st.checkbox("Account active", value=bool(target["active"]), key=f"active_{target['id']}")
+            if st.button("Save account status"):
+                try:
+                    set_user_active(target["id"], desired, user)
+                    st.success("Account status updated.")
+                    rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+elif page == "Audit History":
+    require_admin()
+    st.title("Audit History")
+    rows = audit_rows()
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No audit events recorded yet.")
