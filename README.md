@@ -55,3 +55,25 @@ Clothing,CLT
 
 
 Inventory records also support an optional LOT Number, which is stored separately from the generated SKU.
+
+
+## Recent Add Inventory updates
+
+- Added integer **OST** and **Capacity**, plus a capacity-unit dropdown.
+- Item name and model name have searchable suggestions from existing inventory records.
+- When a new SKU has an Amazon/source URL, the app calls your existing scraper and opens a review step before saving.
+- Amazon title, ASIN, price, rating, review count, availability, description, “About this item”, and specifications can be reviewed/edited. Images are shown as thumbnails without displaying their URLs; drag and drop image tiles to reorder them, remove unwanted images, or use the + tile to add an image URL.
+- Amazon metadata, specifications and ordered image URLs are stored in the existing SQLite `inventory` table. Existing database files are migrated non-destructively.
+
+### Connect your existing Amazon scraper
+
+Place your existing scraper module at `amazon_scraper.py` beside `app.py`. It should expose `extract_amazon_product(product_url)` (sync or async) or `fetch_product_details(product_url)` and return a dictionary with keys such as `asin`, `url`, `title`, `price`, `rating`, `reviews`, `availability`, `description`, `amazon_about_this_item`, `specifications` (dictionary), and `images` (list of image URLs). The adapter is in `amazon_integration.py`.
+
+Install dependencies and the Playwright browser if your scraper uses Playwright:
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+If the scraper module is not present, the app still permits manual entry and image URL ordering; it displays a warning instead of blocking the inventory workflow. Amazon details are fetched only when the generated SKU is not already present.

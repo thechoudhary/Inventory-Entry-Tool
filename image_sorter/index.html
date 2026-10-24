@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--text, #222); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 12px; }
+  .tile { position: relative; height: 168px; border: 1px solid #d7dce2; border-radius: 12px; padding: 8px; background: #fff; cursor: grab; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .tile.dragging { opacity: .4; border: 2px dashed #555; }
+  .tile.over { outline: 2px solid #64748b; outline-offset: 1px; }
+  .tile img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+  .remove { position: absolute; right: 6px; top: 6px; width: 26px; height: 26px; border: 0; border-radius: 50%; background: rgba(20,20,20,.78); color: white; font-size: 18px; line-height: 20px; cursor: pointer; }
+  .add-tile { cursor: default; flex-direction: column; gap: 8px; border-style: dashed; background: #fafafa; padding: 12px; }
+  .plus { font-size: 32px; color: #667085; line-height: 1; }
+  .add-tile input { width: 100%; min-width: 0; padding: 8px; border: 1px solid #cbd0d8; border-radius: 6px; font-size: 12px; }
+  .add-tile button { width: 100%; padding: 7px 10px; border: 0; border-radius: 6px; background: #222; color: white; cursor: pointer; }
+  .hint { font-size: 12px; color: #667085; margin: 0 0 10px; }
+  .empty { color: #667085; font-size: 13px; }
+</style>
+</head>
+<body>
+<p class="hint">Drag images to rearrange them. Use the + tile to add another image URL.</p>
+<div id="grid" class="grid"></div>
+<script>
+(function () {
+  let images = [];
+  let draggedIndex = null;
+  let componentKey = null;
+  const grid = document.getElementById('grid');
+  function sendValue() {
+    window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:setComponentValue', value: images, dataType: 'json'}, '*');
+  }
+  function validUrl(value) {
+    try { const u = new URL(value); return u.protocol === 'https:' || u.protocol === 'http:'; }
+    catch (_) { return false; }
+  }
+  function resizeFrame() { window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:setFrameHeight', height: Math.max(260, document.body.scrollHeight + 8)}, '*'); }
+  function render() {
+    grid.innerHTML = '';
+    if (!images.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty'; empty.textContent = 'No images yet. Add an image URL using the + tile.';
+      grid.appendChild(empty);
+    }
+    images.forEach((url, index) => {
+      const tile = document.createElement('div');
+      tile.className = 'tile'; tile.draggable = true; tile.dataset.index = index;
+      tile.title = 'Drag to change image order';
+      const img = document.createElement('img'); img.src = url; img.alt = 'Product image ' + (index + 1);
+      img.onerror = () => { img.style.display = 'none'; tile.textContent = 'Image could not be loaded'; };
+      const remove = document.createElement('button'); remove.className = 'remove'; remove.type = 'button'; remove.textContent = '×'; remove.title = 'Remove image';
+      remove.addEventListener('click', (event) => { event.stopPropagation(); images.splice(index, 1); render(); sendValue(); });
+      tile.appendChild(img); tile.appendChild(remove);
+      tile.addEventListener('dragstart', (event) => { draggedIndex = index; tile.classList.add('dragging'); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', String(index)); });
+      tile.addEventListener('dragend', () => { draggedIndex = null; tile.classList.remove('dragging'); document.querySelectorAll('.tile.over').forEach(el => el.classList.remove('over')); });
+      tile.addEventListener('dragover', (event) => { event.preventDefault(); tile.classList.add('over'); event.dataTransfer.dropEffect = 'move'; });
+      tile.addEventListener('dragleave', () => tile.classList.remove('over'));
+      tile.addEventListener('drop', (event) => {
+        event.preventDefault(); tile.classList.remove('over');
+        const from = draggedIndex; const to = index;
+        if (from !== null && from !== to && from >= 0 && from < images.length) {
+          const moved = images.splice(from, 1)[0]; images.splice(to, 0, moved); render(); sendValue();
+        }
+      });
+      grid.appendChild(tile);
+    });
+    const addTile = document.createElement('div'); addTile.className = 'tile add-tile';
+    const plus = document.createElement('div'); plus.className = 'plus'; plus.textContent = '+';
+    const input = document.createElement('input'); input.type = 'url'; input.placeholder = 'Paste image URL'; input.setAttribute('aria-label', 'New image URL');
+    const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Add image';
+    const add = () => {
+      const url = input.value.trim();
+      if (!validUrl(url)) { input.setCustomValidity('Enter a valid http or https image URL.'); input.reportValidity(); return; }
+      if (!images.includes(url)) images.push(url);
+      render(); sendValue();
+    };
+    button.addEventListener('click', add);
+    input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); add(); } });
+    addTile.appendChild(plus); addTile.appendChild(input); addTile.appendChild(button); grid.appendChild(addTile);
+    requestAnimationFrame(resizeFrame);
+  }
+  window.addEventListener('message', (event) => {
+    const msg = event.data || {};
+    if (msg.type === 'streamlit:render') {
+      const args = msg.args || {};
+      const incomingKey = args.component_key || '';
+      if (componentKey !== incomingKey) {
+        componentKey = incomingKey;
+        images = Array.isArray(args.images) ? args.images.slice() : [];
+        render();
+      } else if (!images.length && Array.isArray(args.images) && args.images.length) {
+        images = args.images.slice(); render();
+      }
+    }
+  });
+  window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:componentReady', apiVersion: 1}, '*');
+  if (window.ResizeObserver) new ResizeObserver(resizeFrame).observe(document.body);
+  window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:setFrameHeight', height: 260}, '*');
+})();
+</script>
+</body>
+</html>

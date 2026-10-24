@@ -48,7 +48,11 @@ def init_db():
           grade_id INTEGER REFERENCES grades(id), colour_code TEXT NOT NULL DEFAULT '',
           colours_json TEXT NOT NULL DEFAULT '[]', quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity>=0),
           mrp REAL, purchase_price REAL, selling_price REAL, sku TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          lot_number TEXT, source_url TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+          lot_number TEXT, source_url TEXT, ost INTEGER, capacity INTEGER, capacity_unit TEXT,
+          amazon_asin TEXT, amazon_title TEXT, amazon_price TEXT, amazon_rating TEXT,
+          amazon_reviews TEXT, amazon_availability TEXT, description TEXT,
+          amazon_about_this_item TEXT, specifications_json TEXT NOT NULL DEFAULT '{}',
+          images_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_inventory_sku ON inventory(sku);
         CREATE INDEX IF NOT EXISTS idx_inventory_name ON inventory(item_name, model_name);
         CREATE TABLE IF NOT EXISTS audit_log(
@@ -68,7 +72,17 @@ def init_db():
             c.execute("ALTER TABLE inventory ADD COLUMN colours_json TEXT NOT NULL DEFAULT '[]'")
         if "updated_at" not in cols:
             c.execute("ALTER TABLE inventory ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
-        c.execute("UPDATE schema_version SET version=1")
+        migrations = {
+            "ost": "INTEGER", "capacity": "INTEGER", "capacity_unit": "TEXT",
+            "amazon_asin": "TEXT", "amazon_title": "TEXT", "amazon_price": "TEXT",
+            "amazon_rating": "TEXT", "amazon_reviews": "TEXT", "amazon_availability": "TEXT",
+            "description": "TEXT", "amazon_about_this_item": "TEXT",
+            "specifications_json": "TEXT NOT NULL DEFAULT '{}'", "images_json": "TEXT NOT NULL DEFAULT '[]'"
+        }
+        for column, definition in migrations.items():
+            if column not in cols:
+                c.execute(f"ALTER TABLE inventory ADD COLUMN {column} {definition}")
+        c.execute("UPDATE schema_version SET version=2")
 
 def _hash_password(password):
     if len(password) < 10:
@@ -204,7 +218,7 @@ def preview_variants(item_name, model_name, category_id, brand_id, grade_id, col
         # name and their configured codes are concatenated into one colour segment.
         colour_rows.sort(key=lambda r: r["name"].casefold())
         selected_names = [r["name"] for r in colour_rows]
-        combined_code = "".join(re.sub(r"\\s+", "", r["code"]).upper() for r in colour_rows)
+        combined_code = "".join(re.sub(r"\s+", "", r["code"]).upper() for r in colour_rows)
         abbr = [dict(r) for r in c.execute(
             "SELECT name,code,priority FROM abbreviations WHERE active=1 ORDER BY priority DESC, length(name) DESC"
         )]
@@ -274,11 +288,18 @@ def save_inventory_variants(draft, actor):
             else:
                 t = now()
                 cur = c.execute("""INSERT INTO inventory(item_name,model_name,category_id,brand_id,grade_id,colour_code,colours_json,
-                    quantity,mrp,purchase_price,selling_price,sku,lot_number,source_url,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    quantity,mrp,purchase_price,selling_price,sku,lot_number,source_url,ost,capacity,capacity_unit,
+                    amazon_asin,amazon_title,amazon_price,amazon_rating,amazon_reviews,amazon_availability,description,
+                    amazon_about_this_item,specifications_json,images_json,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (draft["item_name"], draft["model_name"], draft["category_id"], draft["brand_id"], draft["grade_id"],
                      colour_code_value, json.dumps(colour_names), draft["quantity"], draft["mrp"], draft["purchase_price"],
-                     draft["selling_price"], v["sku"], draft.get("lot_number"), draft["source_url"], t, t))
+                     draft["selling_price"], v["sku"], draft.get("lot_number"), draft["source_url"], draft.get("ost"),
+                     draft.get("capacity"), draft.get("capacity_unit"), draft.get("amazon_asin"), draft.get("amazon_title"),
+                     draft.get("amazon_price"), draft.get("amazon_rating"), draft.get("amazon_reviews"),
+                     draft.get("amazon_availability"), draft.get("description"), draft.get("amazon_about_this_item"),
+                     json.dumps(draft.get("specifications", {}), ensure_ascii=False),
+                     json.dumps(draft.get("images", []), ensure_ascii=False), t, t))
                 _audit(c, actor, "inventory", cur.lastrowid, "create",
                        new={"sku": v["sku"], "quantity": draft["quantity"], "colours": colour_names})
                 messages.append(f"{v['sku']}: one inventory record created for {', '.join(colour_names) if colour_names else 'no colour'} with quantity {draft['quantity']}.")
@@ -303,9 +324,20 @@ def update_inventory(row_id, changes, actor):
         row = c.execute("SELECT * FROM inventory WHERE id=?", (row_id,)).fetchone()
         if not row: raise ValueError("Inventory record not found.")
         old = dict(row)
-        c.execute("""UPDATE inventory SET item_name=?,model_name=?,quantity=?,mrp=?,purchase_price=?,selling_price=?,lot_number=?,source_url=?,updated_at=? WHERE id=?""",
-            (changes["item_name"],changes["model_name"],changes["quantity"],changes["mrp"],changes["purchase_price"],
-             changes["selling_price"],changes.get("lot_number"),changes["source_url"],now(),row_id))
+        specifications = changes.get("specifications", json.loads(row["specifications_json"] or "{}"))
+        images = changes.get("images", json.loads(row["images_json"] or "[]"))
+        c.execute("""UPDATE inventory SET item_name=?,model_name=?,quantity=?,mrp=?,purchase_price=?,selling_price=?,
+            lot_number=?,source_url=?,ost=?,capacity=?,capacity_unit=?,amazon_asin=?,amazon_title=?,amazon_price=?,
+            amazon_rating=?,amazon_reviews=?,amazon_availability=?,description=?,amazon_about_this_item=?,
+            specifications_json=?,images_json=?,updated_at=? WHERE id=?""",
+            (changes["item_name"], changes["model_name"], changes["quantity"], changes["mrp"], changes["purchase_price"],
+             changes["selling_price"], changes.get("lot_number", row["lot_number"]), changes.get("source_url", row["source_url"]),
+             changes.get("ost", row["ost"]), changes.get("capacity", row["capacity"]), changes.get("capacity_unit", row["capacity_unit"]),
+             changes.get("amazon_asin", row["amazon_asin"]), changes.get("amazon_title", row["amazon_title"]),
+             changes.get("amazon_price", row["amazon_price"]), changes.get("amazon_rating", row["amazon_rating"]),
+             changes.get("amazon_reviews", row["amazon_reviews"]), changes.get("amazon_availability", row["amazon_availability"]),
+             changes.get("description", row["description"]), changes.get("amazon_about_this_item", row["amazon_about_this_item"]),
+             json.dumps(specifications, ensure_ascii=False), json.dumps(images, ensure_ascii=False), now(), row_id))
         _audit(c, actor, "inventory", row_id, "update", old=old, new=changes)
 
 def audit_rows():
@@ -359,3 +391,18 @@ def bulk_add_master(kind, records, actor):
             _audit(c, actor, kind, cur.lastrowid, "bulk_create", new={"name": name, "code": code})
             results.append({"row": row_num, "name": name, "status": "Imported", "detail": "Added successfully."})
     return results
+
+
+def inventory_suggestions(field):
+    """Return unique existing item/model names for input suggestions."""
+    if field not in ("item_name", "model_name"):
+        raise ValueError("Unsupported suggestion field")
+    with get_conn() as c:
+        return [r[0] for r in c.execute(
+            f"SELECT DISTINCT {field} FROM inventory WHERE TRIM(COALESCE({field},''))<>'' ORDER BY {field} COLLATE NOCASE"
+        ).fetchall()]
+
+
+def sku_exists(sku):
+    with get_conn() as c:
+        return c.execute("SELECT 1 FROM inventory WHERE sku=? COLLATE NOCASE", (sku,)).fetchone() is not None
