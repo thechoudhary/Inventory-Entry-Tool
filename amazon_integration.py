@@ -120,16 +120,24 @@ async def extract_amazon_product(product_url):
         "amazon_about_this_item": "",
         "specifications": {},
         "images": [],
+        "error": "",
     }
 
     async with async_playwright() as p:
 
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--disable-extensions",
+                "--window-size=1440,1000",
+            ],
         )
 
-        page = await browser.new_page(
+        context = await browser.new_context(
             locale="en-IN",
             viewport={"width": 1440, "height": 1000},
             user_agent=(
@@ -138,6 +146,16 @@ async def extract_amazon_product(product_url):
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
+
+        # Remove headless/automation signals that Amazon detects
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
+
+        page = await context.new_page()
 
         try:
             response = await page.goto(
@@ -162,9 +180,9 @@ async def extract_amazon_product(product_url):
                 or "captcha" in page_title
                 or "/errors/validatecaptcha" in page.url
             ):
-                logger.warning(
-                    "Amazon returned an access check. No attempt will be made to bypass it."
-                )
+                msg = "Amazon returned a CAPTCHA / bot check — could not fetch product details."
+                logger.warning(msg)
+                product["error"] = msg
                 return product
 
             # Product title and pricing.
@@ -212,7 +230,9 @@ async def extract_amazon_product(product_url):
             product["images"] = await scrape_images_from_page(page)
 
         except Exception as exc:
+            msg = f"Scrape failed: {exc}"
             logger.exception("Product extraction failed")
+            product["error"] = msg
 
         finally:
             await browser.close()

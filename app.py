@@ -580,10 +580,14 @@ elif page == "Add Inventory":
                         try:
                             with st.spinner("Fetching product details from Amazon — this may take up to 30 seconds..."):
                                 raw_amazon = fetch_amazon_product(clean_amazon_url(source_url))
-                            amazon_data = normalize_amazon_data(raw_amazon)
-                            st.success("Amazon details fetched. Review and edit below before saving.")
+                            scrape_err = raw_amazon.get("error", "")
+                            if scrape_err:
+                                st.warning(f"Amazon fetch issue: {scrape_err} — You can enter details manually.")
+                            else:
+                                amazon_data = normalize_amazon_data(raw_amazon)
+                                st.success("Amazon details fetched. Review and edit below before saving.")
                         except Exception as scrape_error:
-                            st.warning(f"Amazon fetch incomplete: {scrape_error}. You can enter details manually.")
+                            st.warning(f"Amazon fetch failed: {scrape_error} — You can enter details manually.")
                 else:
                     # Existing SKU — pre-fill review fields from the existing DB record
                     existing_id = variant.get("existing_id")
