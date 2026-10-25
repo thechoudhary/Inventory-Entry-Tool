@@ -5,16 +5,27 @@ import re
 import json
 import asyncio
 import logging
+import subprocess
+import sys
+import concurrent.futures
 
-import nest_asyncio
 import pandas as pd
 
 from pathlib import Path
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
-nest_asyncio.apply()
 logger = logging.getLogger(__name__)
+
+# Install Chromium browser binary if not already present (needed on Streamlit Cloud).
+# This is idempotent — Playwright skips the download when the binary already exists.
+try:
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=False, capture_output=True,
+    )
+except Exception:
+    pass
 
 
 
@@ -113,7 +124,10 @@ async def extract_amazon_product(product_url):
 
     async with async_playwright() as p:
 
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
 
         page = await browser.new_page(
             locale="en-IN",
@@ -369,5 +383,17 @@ async def get_spec(page):
 
 
 def fetch_amazon_product(product_url):
-    result = asyncio.run(extract_amazon_product(product_url))
-    return result
+    """Run the async scraper in an isolated worker thread with its own event loop.
+
+    This avoids any interaction with Streamlit's anyio-based event loop and works
+    on all Python versions without nest_asyncio patching.
+    """
+    def _run():
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(extract_amazon_product(product_url))
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(_run).result()

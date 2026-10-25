@@ -5,7 +5,14 @@ from hashlib import scrypt
 import hmac
 from sku import generate_sku, colour_code
 
-DB_PATH = Path(os.environ.get("INVENTORY_DB_PATH", Path(__file__).with_name("inventory.db")))
+def _default_db_path():
+    # Streamlit Cloud mounts the app in a read-only directory; /tmp is always writable.
+    # Locally the DB sits next to this file (original behaviour).
+    if os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_STREAMLIT_CLOUD"):
+        return Path("/tmp/inventory.db")
+    return Path(__file__).with_name("inventory.db")
+
+DB_PATH = Path(os.environ.get("INVENTORY_DB_PATH", _default_db_path()))
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")

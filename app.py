@@ -27,6 +27,18 @@ autocomplete_component = components.declare_component(
 st.set_page_config(page_title="Inventory & SKU Manager", page_icon="📦", layout="wide")
 init_db()
 
+# ── Auto-seed admin from Streamlit secrets (Cloud deployment) ─────────────
+# Set [admin] username and password in the Streamlit Cloud secrets manager.
+# On a fresh DB the admin is created automatically; no setup_admin.py needed.
+try:
+    _sec = st.secrets.get("admin", {})
+    _su, _sp = _sec.get("username", ""), _sec.get("password", "")
+    if _su and _sp and admin_count() == 0:
+        from db import create_initial_admin
+        create_initial_admin(_su, _sp)
+except Exception:
+    pass  # secrets not configured or admin already exists — ignore silently
+
 # ── Global CSS ─────────────────────────────────────────────────────────────
 st.markdown("""<style>
 :root {
@@ -224,7 +236,7 @@ if not logged_in():
                 rerun()
             else:
                 st.error("Invalid username or password.")
-        st.caption("First run? Create an admin: `python setup_admin.py`")
+        st.caption("Admin credentials are set via Streamlit secrets or the `setup_admin.py` script.")
     st.stop()
 
 
