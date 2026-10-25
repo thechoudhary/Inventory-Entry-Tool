@@ -1,24 +1,20 @@
-"""Adapter for the user's existing Amazon product scraper.
-
-Place the scraper module beside app.py as amazon_scraper.py and expose either:
-  - extract_amazon_product(product_url)  (sync or async), or
-  - fetch_product_details(product_url)   (sync or async).
-The function should return the product dictionary described in the README.
-"""
+"""Amazon product scraper using headless Playwright/Chromium."""
 
 import os
 import re
 import json
 import asyncio
-import aiohttp
+import logging
+
+import nest_asyncio
 import pandas as pd
 
 from pathlib import Path
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
-
-
+nest_asyncio.apply()
+logger = logging.getLogger(__name__)
 
 
 
@@ -61,11 +57,6 @@ def normalize_image_url(url):
     )
 
 
-
-
-
-
-
 async def extract_about_this_item(page):
     selectors = [
         "#feature-bullets ul li span.a-list-item",
@@ -100,12 +91,6 @@ async def extract_about_this_item(page):
     return bullets
 
 
-
-
-
-
-
-
 # --------------------------------------------------
 # MAIN EXTRACTION FUNCTION
 # --------------------------------------------------
@@ -121,10 +106,9 @@ async def extract_amazon_product(product_url):
         "reviews": "",
         "availability": "",
         "description": "",
-        "amazon_about_this_item":"",
+        "amazon_about_this_item": "",
         "specifications": {},
         "images": [],
-        # "downloaded_images": [],
     }
 
     async with async_playwright() as p:
@@ -134,6 +118,11 @@ async def extract_amazon_product(product_url):
         page = await browser.new_page(
             locale="en-IN",
             viewport={"width": 1440, "height": 1000},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
         )
 
         try:
@@ -143,10 +132,14 @@ async def extract_amazon_product(product_url):
                 timeout=60000,
             )
 
-            await page.wait_for_timeout(3000)
+            # Wait for the product title rather than a fixed delay
+            try:
+                await page.wait_for_selector("#productTitle", timeout=12000)
+            except Exception:
+                pass  # proceed even if title selector is slow
 
-            print("HTTP status:", response.status if response else "Unknown")
-            print("Page title:", await page.title())
+            logger.info("HTTP status: %s", response.status if response else "Unknown")
+            logger.info("Page title: %s", await page.title())
 
             page_title = (await page.title()).lower()
 
@@ -155,9 +148,8 @@ async def extract_amazon_product(product_url):
                 or "captcha" in page_title
                 or "/errors/validatecaptcha" in page.url
             ):
-                print(
-                    "Amazon returned an access check. "
-                    "No attempt will be made to bypass it."
+                logger.warning(
+                    "Amazon returned an access check. No attempt will be made to bypass it."
                 )
                 return product
 
@@ -195,21 +187,18 @@ async def extract_amazon_product(product_url):
                 or await get_text(page, "#feature-bullets")
             )
 
-
             about_items = await extract_about_this_item(page)
 
             product["amazon_about_this_item"] = json.dumps(
                 about_items,
                 ensure_ascii=False
             )
-            
+
             product["specifications"] = await get_spec(page)
-                        # Capture gallery images.
             product["images"] = await scrape_images_from_page(page)
 
-           
         except Exception as exc:
-            print("Product extraction failed:", repr(exc))
+            logger.exception("Product extraction failed")
 
         finally:
             await browser.close()
@@ -217,12 +206,9 @@ async def extract_amazon_product(product_url):
     return product
 
 
-#-------------------------------
-#.  Images
-#--------------------------------
-
-
-
+# ------------------------------
+# Images
+# ------------------------------
 
 DOWNLOAD_DIR = "amazon_product_images"
 
@@ -242,115 +228,60 @@ def get_high_res_url(url):
     )
 
 
-# async def download_image(session, url, file_path):
-#     try:
-#         timeout = aiohttp.ClientTimeout(total=30)
-
-#         async with session.get(url, timeout=timeout) as response:
-#             if response.status != 200:
-#                 print(f"HTTP {response.status}: {url}")
-#                 return False
-
-#             content_type = response.headers.get(
-#                 "Content-Type", ""
-#             ).lower()
-
-#             if not content_type.startswith("image/"):
-#                 print(f"Not an image: {url}")
-#                 return False
-
-#             content = await response.read()
-
-#             with open(file_path, "wb") as f:
-#                 f.write(content)
-
-#             print(f"Downloaded: {os.path.basename(file_path)}")
-#             return True
-
-#     except Exception as exc:
-#         print(f"Failed: {url} | {exc}")
-#         return False
-
-
 async def scrape_images_from_page(page):
 
     image_urls = set()
 
-    async with async_playwright() as p:
-        
-        main_image = page.locator(
-            "#landingImage, #imgTagWrapperId img"
-        ).first
+    main_image = page.locator(
+        "#landingImage, #imgTagWrapperId img"
+    ).first
 
-        if await main_image.count():
-            for attr in ["data-old-hires", "data-a-dynamic-image", "src"]:
-                value = await main_image.get_attribute(attr)
+    if await main_image.count():
+        for attr in ["data-old-hires", "data-a-dynamic-image", "src"]:
+            value = await main_image.get_attribute(attr)
 
-                if not value:
-                    continue
+            if not value:
+                continue
 
-                if attr == "data-a-dynamic-image":
-                    try:
-                        data = json.loads(value)
-                        if isinstance(data, dict):
-                            image_urls.update(data.keys())
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                else:
-                    image_urls.add(value)
-
-        # 2. Extract images only from the product gallery.
-        # Do not scan every img element on the page.
-        gallery = page.locator("#altImages")
-
-        if await gallery.count():
-            gallery_images = gallery.locator("img")
-            print(
-                "Product gallery elements:",
-                await gallery_images.count(),
-            )
-
-            for i in range(await gallery_images.count()):
-                img = gallery_images.nth(i)
-
+            if attr == "data-a-dynamic-image":
                 try:
-                    parent_class = await img.evaluate("""
-                        el => {
-                            const li = el.closest('li');
-                            return li ? li.className : '';
-                        }
-                    """)
+                    data = json.loads(value)
+                    if isinstance(data, dict):
+                        image_urls.update(data.keys())
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            else:
+                image_urls.add(value)
 
-                    if any(
-                        word in parent_class.lower()
-                        for word in ["video", "swatch", "spinner"]
-                    ):
-                        continue
-
-                    for attr in [
-                        "data-old-hires",
-                        "data-a-dynamic-image",
-                        "src",
-                    ]:
-                        value = await img.get_attribute(attr)
-
-                        if not value:
-                            continue
-
-                        if attr == "data-a-dynamic-image":
-                            try:
-                                data = json.loads(value)
-                                if isinstance(data, dict):
-                                    image_urls.update(data.keys())
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-                        else:
-                            image_urls.add(value)
-
-                except Exception as exc:
-                    print(f"Skipping gallery item {i + 1}: {exc}")
-
-        
+    # Batch-extract gallery image URLs via a single JS call instead of
+    # iterating each thumbnail in Python (cuts many round-trips).
+    gallery_urls = await page.evaluate("""() => {
+        const gallery = document.querySelector('#altImages');
+        if (!gallery) return [];
+        const results = [];
+        gallery.querySelectorAll('img').forEach(img => {
+            const li = img.closest('li');
+            if (li) {
+                const cls = li.className.toLowerCase();
+                if (cls.includes('video') || cls.includes('swatch') || cls.includes('spinner')) return;
+            }
+            ['data-old-hires', 'data-a-dynamic-image', 'src'].forEach(attr => {
+                const val = img.getAttribute(attr);
+                if (!val) return;
+                if (attr === 'data-a-dynamic-image') {
+                    try {
+                        const d = JSON.parse(val);
+                        if (typeof d === 'object') Object.keys(d).forEach(u => results.push(u));
+                    } catch (_) {}
+                } else {
+                    results.push(val);
+                }
+            });
+        });
+        return results;
+    }""")
+    image_urls.update(gallery_urls or [])
+    logger.debug("Product gallery elements (raw): %d", len(gallery_urls or []))
 
     # 3. Filter and normalize Amazon product image URLs.
     final_urls = set()
@@ -378,93 +309,65 @@ async def scrape_images_from_page(page):
 
     image_urls = sorted(final_urls)
 
-    print(f"\nFound {len(image_urls)} unique image URLs.")
+    logger.info("Found %d unique image URLs.", len(image_urls))
 
     if not image_urls:
-        print("No gallery images found. Amazon may be using a different gallery.")
-        return
-
-   
-
-    
-
-  
-
-    # print(f"\nCompleted: {success_count}/{len(image_urls)} images downloaded.")
-    # print("Output folder:", Path(DOWNLOAD_DIR).resolve())
+        logger.info("No gallery images found. Amazon may be using a different gallery.")
+        return []
 
     return image_urls
 
 
-
-
-
-
-
 async def get_spec(page):
-    # Wait briefly for Amazon's product specifications to load
-    await page.wait_for_timeout(2000)
-
-    rows = page.locator(
-        "tr[class*='po-'], "
-        "#productOverview_feature_div tr, "
-        "#productDetails_techSpec_section_1 tr, "
-        "#productDetails_detailBullets_sections1 tr, "
-        "#productDetails_db_sections tr, "
-        "#poExpander tr"
-    )
-    specifications = {}
-    for i in range(await rows.count()):
-        row = rows.nth(i)
-
-        # Extract the specification label
-        key_locator = row.locator(
-            "span.a-text-bold, th"
-        ).first
-
-        # Extract the specification value
-        value_locator = row.locator(
-            "span.po-break-word, td"
+    # Give specs a chance to appear (but don't wait if they're already there)
+    try:
+        await page.wait_for_selector(
+            "tr[class*='po-'], #productOverview_feature_div tr, "
+            "#productDetails_techSpec_section_1 tr",
+            timeout=5000,
         )
+    except Exception:
+        pass
 
-        key = ""
-        value = ""
-
-        if await key_locator.count():
-            key = (await key_locator.inner_text()).strip()
-
-        if await value_locator.count():
-            # Prefer the dedicated value span
-            value_span = row.locator("span.po-break-word")
-
-            if await value_span.count():
-                value = (await value_span.first.inner_text()).strip()
-            else:
-                cells = row.locator("td")
-
-                if await cells.count() >= 2:
-                    key = (await cells.nth(0).inner_text()).strip()
-                    value = (await cells.nth(1).inner_text()).strip()
-
-        if key and value and key != value:
-            specifications[key.rstrip(":")] = value
-    return specifications
-
-    # print("Specifications found:", len(product["specifications"]))
-    # print(product["specifications"])
-
+    # Extract all key/value pairs in a single JS round-trip for speed
+    return await page.evaluate("""() => {
+        const result = {};
+        const selectorGroups = [
+            'tr[class*="po-"]',
+            '#productOverview_feature_div tr',
+            '#productDetails_techSpec_section_1 tr',
+            '#productDetails_detailBullets_sections1 tr',
+            '#productDetails_db_sections tr',
+            '#poExpander tr',
+        ];
+        for (const sel of selectorGroups) {
+            const rows = document.querySelectorAll(sel);
+            if (!rows.length) continue;
+            rows.forEach(row => {
+                const keyEl = row.querySelector('span.a-text-bold, th');
+                const valSpan = row.querySelector('span.po-break-word');
+                const cells = row.querySelectorAll('td');
+                let key = '', val = '';
+                if (keyEl) key = keyEl.innerText.trim().replace(/:$/, '');
+                if (valSpan) {
+                    val = valSpan.innerText.trim();
+                } else if (cells.length >= 2) {
+                    key = cells[0].innerText.trim().replace(/:$/, '');
+                    val = cells[1].innerText.trim();
+                }
+                if (key && val && key !== val) result[key] = val;
+            });
+            if (Object.keys(result).length) break;
+        }
+        return result;
+    }""")
 
 
 # --------------------------------------------------
-# SAVE OUTPUT
+# PUBLIC SYNC API
 # --------------------------------------------------
-
-
 
 
 def fetch_amazon_product(product_url):
-
     result = asyncio.run(extract_amazon_product(product_url))
     return result
-
-
