@@ -18,14 +18,19 @@ from playwright.async_api import async_playwright
 logger = logging.getLogger(__name__)
 
 # Install Chromium browser binary if not already present (needed on Streamlit Cloud).
-# This is idempotent — Playwright skips the download when the binary already exists.
+# Logs output so failures are visible in Streamlit Cloud logs.
 try:
-    subprocess.run(
+    _install = subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
-        check=False, capture_output=True,
+        check=False, capture_output=True, text=True,
     )
-except Exception:
-    pass
+    if _install.returncode != 0:
+        logger.warning("playwright install chromium failed (rc=%s): %s",
+                       _install.returncode, _install.stderr.strip())
+    else:
+        logger.info("playwright install chromium: %s", _install.stdout.strip() or "OK")
+except Exception as _e:
+    logger.warning("Could not run playwright install: %s", _e)
 
 
 
@@ -171,22 +176,33 @@ async def extract_amazon_product(product_url):
                 pass  # proceed even if title selector is slow
 
             logger.info("HTTP status: %s", response.status if response else "Unknown")
-            logger.info("Page title: %s", await page.title())
-
             page_title = (await page.title()).lower()
+            current_url = page.url
+            logger.info("Page title: %s | URL: %s", page_title, current_url)
 
+            # Detect bot checks — Amazon uses several patterns
             if (
                 "robot check" in page_title
                 or "captcha" in page_title
-                or "/errors/validatecaptcha" in page.url
+                or "/errors/validatecaptcha" in current_url
+                or "api-services" in current_url
+                or "auth-redirect" in current_url
+                or page_title in ("", "amazon.in")
             ):
-                msg = "Amazon returned a CAPTCHA / bot check — could not fetch product details."
+                msg = f"Amazon returned a bot/access check (title='{page_title}', url={current_url}) — could not fetch product details."
                 logger.warning(msg)
                 product["error"] = msg
                 return product
 
             # Product title and pricing.
             product["title"] = await get_text(page, "#productTitle")
+
+            # If the title is empty the page probably didn't load proper product content
+            if not product["title"]:
+                msg = f"Product page loaded but no title found (page='{page_title}'). Amazon may be blocking this request from cloud IPs."
+                logger.warning(msg)
+                product["error"] = msg
+                return product
 
             product["price"] = (
                 await get_text(page, ".priceToPay")
