@@ -39,6 +39,18 @@ try:
 except Exception:
     pass  # secrets not configured or admin already exists — ignore silently
 
+# ── ScraperAPI key (needed on Streamlit Cloud to bypass Amazon IP blocks) ─────
+# Add SCRAPERAPI_KEY = "your_key" to Streamlit Cloud secrets.
+# Free tier: https://www.scraperapi.com (1,000 requests/month)
+_SCRAPERAPI_KEY = ""
+try:
+    _SCRAPERAPI_KEY = (
+        st.secrets.get("SCRAPERAPI_KEY", "")
+        or st.secrets.get("scraper", {}).get("api_key", "")
+    )
+except Exception:
+    pass
+
 # ── Global CSS ─────────────────────────────────────────────────────────────
 st.markdown("""<style>
 :root {
@@ -579,7 +591,7 @@ elif page == "Add Inventory":
                     if source_url:
                         try:
                             with st.spinner("Fetching product details from Amazon — this may take up to 30 seconds..."):
-                                raw_amazon = fetch_amazon_product(clean_amazon_url(source_url))
+                                raw_amazon = fetch_amazon_product(clean_amazon_url(source_url), proxy_api_key=_SCRAPERAPI_KEY or None)
                             scrape_err = raw_amazon.get("error", "")
                             if scrape_err:
                                 st.warning(f"Amazon fetch issue: {scrape_err} — You can enter details manually.")

@@ -111,7 +111,7 @@ async def extract_about_this_item(page):
 # MAIN EXTRACTION FUNCTION
 # --------------------------------------------------
 
-async def extract_amazon_product(product_url):
+async def extract_amazon_product(product_url, proxy_api_key=None):
 
     product = {
         "asin": extract_asin(product_url),
@@ -128,6 +128,17 @@ async def extract_amazon_product(product_url):
         "error": "",
     }
 
+    # ScraperAPI proxy — routes through residential IPs to bypass cloud IP blocks.
+    # Set SCRAPERAPI_KEY in Streamlit secrets (or env) to enable; omit for local runs.
+    proxy = None
+    if proxy_api_key:
+        proxy = {
+            "server":   "http://proxy-server.scraperapi.com:8001",
+            "username": "scraperapi",
+            "password": proxy_api_key,
+        }
+        logger.info("Using ScraperAPI proxy for this request.")
+
     async with async_playwright() as p:
 
         browser = await p.chromium.launch(
@@ -142,7 +153,7 @@ async def extract_amazon_product(product_url):
             ],
         )
 
-        context = await browser.new_context(
+        context_kwargs = dict(
             locale="en-IN",
             viewport={"width": 1440, "height": 1000},
             user_agent=(
@@ -150,7 +161,12 @@ async def extract_amazon_product(product_url):
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
+            ignore_https_errors=True,
         )
+        if proxy:
+            context_kwargs["proxy"] = proxy
+
+        context = await browser.new_context(**context_kwargs)
 
         # Remove headless/automation signals that Amazon detects
         await context.add_init_script("""
@@ -418,16 +434,17 @@ async def get_spec(page):
 # --------------------------------------------------
 
 
-def fetch_amazon_product(product_url):
+def fetch_amazon_product(product_url, proxy_api_key=None):
     """Run the async scraper in an isolated worker thread with its own event loop.
 
-    This avoids any interaction with Streamlit's anyio-based event loop and works
-    on all Python versions without nest_asyncio patching.
+    Pass proxy_api_key (ScraperAPI key) to route through residential IPs —
+    required when running on Streamlit Cloud or any AWS/GCP/Azure host that
+    Amazon blocks at the IP level.
     """
     def _run():
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(extract_amazon_product(product_url))
+            return loop.run_until_complete(extract_amazon_product(product_url, proxy_api_key))
         finally:
             loop.close()
 
