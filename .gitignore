@@ -1,5 +1,47 @@
+# Python
 *.pyc
+*.pyo
+*.pyd
 __pycache__/
-*.env
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.*
 venv/
-*.DS_Store
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Database (local data — do not commit)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Streamlit secrets (never commit — use the Cloud secrets manager)
+.streamlit/secrets.toml
+
+# Playwright
+.playwright-mcp/
+playwright-report/
+test-results/
+
+# Logs & temp
+*.log
+*.tmp
+*.bak
+amazon_product_images/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
