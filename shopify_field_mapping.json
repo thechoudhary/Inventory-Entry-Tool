@@ -1,0 +1,98 @@
+{
+  "description": "End-to-end mapping of Shopify CSV fields to Inventory Tool data sources",
+  "groups": {
+    "group_1_correct": {
+      "label": "Currently generated correctly — no changes needed",
+      "fields": [
+        { "shopify_field": "Title",                   "source_type": "db_field",   "source": "item_name" },
+        { "shopify_field": "Body (HTML)",              "source_type": "db_field",   "source": "description" },
+        { "shopify_field": "Vendor",                   "source_type": "db_field",   "source": "brand" },
+        { "shopify_field": "Type",                     "source_type": "db_field",   "source": "sub_category" },
+        { "shopify_field": "Published",                "source_type": "hardcoded",  "source": "TRUE" },
+        { "shopify_field": "Variant SKU",              "source_type": "db_field",   "source": "sku" },
+        { "shopify_field": "Variant Inventory Qty",    "source_type": "db_field",   "source": "quantity" },
+        { "shopify_field": "Variant Price",            "source_type": "db_field",   "source": "selling_price" },
+        { "shopify_field": "Variant Compare At Price", "source_type": "db_field",   "source": "osp" },
+        { "shopify_field": "Variant Requires Shipping","source_type": "hardcoded",  "source": "TRUE" },
+        { "shopify_field": "Variant Taxable",          "source_type": "hardcoded",  "source": "TRUE" },
+        { "shopify_field": "Image Src",                "source_type": "db_field",   "source": "images_json", "notes": "First image on main row; additional images as separate rows with Image Position incremented" },
+        { "shopify_field": "Image Position",           "source_type": "derived",    "source": "auto-incremented per image" },
+        { "shopify_field": "Image Alt Text",           "source_type": "db_field",   "source": "item_name" },
+        { "shopify_field": "SEO Title",                "source_type": "db_field",   "source": "amazon_title", "notes": "Falls back to item_name if amazon_title is empty" },
+        { "shopify_field": "SEO Description",          "source_type": "db_field",   "source": "description", "notes": "First 320 characters" }
+      ]
+    },
+
+    "group_2_fixed": {
+      "label": "Were generated with wrong mapping — now fixed",
+      "fields": [
+        { "shopify_field": "Handle",        "source_type": "auto",      "source": null,   "notes": "Removed from export — Shopify auto-generates from Title on upload" },
+        { "shopify_field": "Tags",          "source_type": "derived",   "source": "grade, brand, category, sub_category", "notes": "Format: 'Bettr Stores, {grade}, {brand}, {category}, {sub_category}'" },
+        { "shopify_field": "Option1 Name",  "source_type": "hardcoded", "source": "Grade" },
+        { "shopify_field": "Option1 Value", "source_type": "db_field",  "source": "grade" }
+      ]
+    },
+
+    "group_3_derived": {
+      "label": "Missing but derivable from existing DB data — no new DB columns needed",
+      "fields": [
+        { "shopify_field": "Option1 Linked To",                                          "source_type": "hardcoded", "source": "" },
+        { "shopify_field": "Option2 Name",                                               "source_type": "derived",   "source": "colours_json", "notes": "'Color' when colours exist, blank otherwise" },
+        { "shopify_field": "Option2 Value",                                              "source_type": "db_field",  "source": "colours_json", "notes": "All colours lowercase, semicolon-separated" },
+        { "shopify_field": "Option2 Linked To",                                          "source_type": "hardcoded", "source": "" },
+        { "shopify_field": "Key Features (product.metafields.custom.key_features)",      "source_type": "db_field",  "source": "amazon_about_this_item" },
+        { "shopify_field": "Model  (product.metafields.custom.model)",                   "source_type": "db_field",  "source": "model_name" },
+        { "shopify_field": "OSP (product.metafields.custom.osp)",                        "source_type": "db_field",  "source": "osp" },
+        { "shopify_field": "Specifications (product.metafields.custom.specifications)",  "source_type": "db_field",  "source": "specifications_json", "notes": "Formatted as 'Key: Value' lines" },
+        { "shopify_field": "Color (product.metafields.shopify.color-pattern)",           "source_type": "db_field",  "source": "colours_json", "notes": "All colours lowercase, semicolon-separated" },
+        { "shopify_field": "Cost per item",                                              "source_type": "db_field",  "source": "purchase_price" }
+      ]
+    },
+
+    "group_4_hardcoded": {
+      "label": "Constant values — hardcoded in export, no DB needed",
+      "fields": [
+        { "shopify_field": "Variant Inventory Tracker",    "source_type": "hardcoded", "source": "shopify" },
+        { "shopify_field": "Variant Inventory Policy",     "source_type": "hardcoded", "source": "deny" },
+        { "shopify_field": "Variant Fulfillment Service",  "source_type": "hardcoded", "source": "manual" },
+        { "shopify_field": "Gift Card",                    "source_type": "hardcoded", "source": "FALSE" },
+        { "shopify_field": "Status",                       "source_type": "hardcoded", "source": "active" },
+        { "shopify_field": "Variant Packed Dimension Unit","source_type": "hardcoded", "source": "cm" }
+      ]
+    },
+
+    "group_5_new_db": {
+      "label": "New fields — require new DB columns, form inputs, and export mapping",
+      "fields": [
+        { "shopify_field": "Product Category",                                               "new_db_column": "shopify_product_category", "db_type": "TEXT",    "notes": "Full Shopify taxonomy path e.g. 'Home & Garden > Kitchen & Dining > Kitchen Appliances > Juicers'" },
+        { "shopify_field": "What's Inside the Box (product.metafields.custom.whats_in_the_box)", "new_db_column": "whats_in_the_box",     "db_type": "TEXT",    "notes": "Contents list separate from Key Features" },
+        { "shopify_field": "Variant Grams",                                                  "new_db_column": "weight_grams",             "db_type": "INTEGER", "notes": "Weight in grams" },
+        { "shopify_field": "Variant Weight Unit",                                            "new_db_column": "weight_unit",              "db_type": "TEXT",    "notes": "Values: g or kg" },
+        { "shopify_field": "Variant Packed Length",                                          "new_db_column": "packed_length",            "db_type": "REAL",    "notes": "In cm" },
+        { "shopify_field": "Variant Packed Width",                                           "new_db_column": "packed_width",             "db_type": "REAL",    "notes": "In cm" },
+        { "shopify_field": "Variant Packed Height",                                          "new_db_column": "packed_height",            "db_type": "REAL",    "notes": "In cm" },
+        { "shopify_field": "shopify_standard_metafields",                                    "new_db_column": "shopify_metafields_json",  "db_type": "TEXT",    "notes": "JSON blob for 50+ product-type-specific attributes (Power source, Material, Juicer type, Soleplate type etc.) — each product uses only 3-8 of these" }
+      ]
+    },
+
+    "group_6_always_empty": {
+      "label": "Always empty in catalog — leave blank, no action needed",
+      "fields": [
+        { "shopify_field": "Option3 Name" },
+        { "shopify_field": "Option3 Value" },
+        { "shopify_field": "Option3 Linked To" },
+        { "shopify_field": "Unit Price Total Measure" },
+        { "shopify_field": "Unit Price Total Measure Unit" },
+        { "shopify_field": "Unit Price Base Measure" },
+        { "shopify_field": "Unit Price Base Measure Unit" },
+        { "shopify_field": "Variant Barcodes" },
+        { "shopify_field": "Variant Tax Code" },
+        { "shopify_field": "Product rating count (product.metafields.reviews.rating_count)" },
+        { "shopify_field": "Complementary products (product.metafields.shopify--discovery--product_recommendation.complementary_products)" },
+        { "shopify_field": "Related products (product.metafields.shopify--discovery--product_recommendation.related_products)" },
+        { "shopify_field": "Related products settings (product.metafields.shopify--discovery--product_recommendation.related_products_display)" },
+        { "shopify_field": "Search product boosts (product.metafields.shopify--discovery--product_search_boost.queries)" }
+      ]
+    }
+  }
+}

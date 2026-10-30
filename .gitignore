@@ -29,6 +29,10 @@ desktop.ini
 # Streamlit secrets (never commit — use the Cloud secrets manager)
 .streamlit/secrets.toml
 
+# Notebooks / scratch files that may hold access tokens — never commit
+*.ipynb
+shopify_access_token.ipynb
+
 # Playwright
 .playwright-mcp/
 playwright-report/
@@ -45,3 +49,6 @@ amazon_product_images/
 .idea/
 *.suo
 *.user
+*.png
+*.jpg
+*.jpeg

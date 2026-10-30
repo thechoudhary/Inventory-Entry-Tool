@@ -182,21 +182,17 @@ async def extract_amazon_product(product_url, proxy_api_key=None):
             response = await page.goto(
                 product_url,
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
 
-            # Wait for the product title rather than a fixed delay
-            try:
-                await page.wait_for_selector("#productTitle", timeout=12000)
-            except Exception:
-                pass  # proceed even if title selector is slow
-
-            logger.info("HTTP status: %s", response.status if response else "Unknown")
+            # Check for bot/CAPTCHA immediately — before any waits.
+            # If Amazon blocked us the page loads instantly with a CAPTCHA title;
+            # detecting it here avoids wasting 8 s on wait_for_selector.
             page_title = (await page.title()).lower()
             current_url = page.url
-            logger.info("Page title: %s | URL: %s", page_title, current_url)
+            logger.info("HTTP status: %s | title: %s | url: %s",
+                        response.status if response else "?", page_title, current_url)
 
-            # Detect bot checks — Amazon uses several patterns
             if (
                 "robot check" in page_title
                 or "captcha" in page_title
@@ -209,6 +205,12 @@ async def extract_amazon_product(product_url, proxy_api_key=None):
                 logger.warning(msg)
                 product["error"] = msg
                 return product
+
+            # Real product page — wait for the title to finish rendering.
+            try:
+                await page.wait_for_selector("#productTitle", timeout=8000)
+            except Exception:
+                pass
 
             # Product title and pricing.
             product["title"] = await get_text(page, "#productTitle")
@@ -448,5 +450,20 @@ def fetch_amazon_product(product_url, proxy_api_key=None):
         finally:
             loop.close()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(_run).result()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_run)
+    try:
+        return future.result(timeout=60)
+    except concurrent.futures.TimeoutError:
+        logger.warning("fetch_amazon_product timed out after 60 seconds — Playwright/Chromium may be hung.")
+        return {
+            "asin": "", "url": product_url,
+            "title": "", "price": "", "rating": "", "reviews": "",
+            "availability": "", "description": "", "amazon_about_this_item": "",
+            "specifications": {}, "images": [],
+            "error": "Fetch timed out after 60 seconds. Amazon may be blocking this request, or Playwright/Chromium is unresponsive. Try adding a ScraperAPI key in Streamlit secrets.",
+        }
+    finally:
+        # Do NOT wait — if Playwright is hung the thread never finishes.
+        # Abandon it so the caller gets a response within the timeout.
+        executor.shutdown(wait=False)

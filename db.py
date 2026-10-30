@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from hashlib import scrypt
 import hmac
-from sku import generate_sku, colour_code
+from sku import generate_sku, colour_code, generate_product_handle, extract_physical_from_specs
 
 def _default_db_path():
     # Streamlit Cloud mounts the app in a read-only directory; /tmp is always writable.
@@ -22,6 +22,7 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 def init_db():
@@ -86,11 +87,15 @@ def init_db():
           id INTEGER PRIMARY KEY, user_id INTEGER, username TEXT, entity_type TEXT NOT NULL,
           entity_id INTEGER, action TEXT NOT NULL, old_value TEXT, new_value TEXT,
           created_at TEXT NOT NULL, created_by TEXT);
+        CREATE TABLE IF NOT EXISTS taxonomy_categories(
+          gid TEXT PRIMARY KEY, name TEXT NOT NULL, full_name TEXT NOT NULL);
         """)
 
         row = c.execute("SELECT COUNT(*) AS n FROM schema_version").fetchone()
         if row["n"] == 0:
             c.execute("INSERT INTO schema_version(version) VALUES (1)")
+        _ver_row = c.execute("SELECT version FROM schema_version").fetchone()
+        prev_version = _ver_row["version"] if _ver_row else 0
 
         # ── Non-destructive column migrations ────────────────────────────────
         inv_cols = {r["name"] for r in c.execute("PRAGMA table_info(inventory)")}
@@ -123,6 +128,21 @@ def init_db():
             ("sub_category_id",        "INTEGER REFERENCES sub_categories(id)"),
             ("created_by",             "TEXT"),
             ("modified_by",            "TEXT"),
+            ("whats_in_the_box",       "TEXT"),
+            ("weight_grams",           "REAL"),
+            ("weight_unit",            "TEXT"),
+            ("packed_length",          "REAL"),
+            ("packed_width",           "REAL"),
+            ("packed_height",          "REAL"),
+            ("shopify_status",         "TEXT"),
+            ("shopify_pushed_at",      "TEXT"),
+            ("shopify_synced_qty",     "INTEGER NOT NULL DEFAULT 0"),
+            ("variant_image",          "TEXT"),
+            ("product_handle",         "TEXT"),
+            ("hs_code",                "TEXT"),
+            ("warehouse_location",     "TEXT"),
+            ("shopify_category",       "TEXT"),
+            ("shopify_category_id",    "TEXT"),
         ]:
             if col not in inv_cols:
                 c.execute(f"ALTER TABLE inventory ADD COLUMN {col} {defn}")
@@ -144,7 +164,87 @@ def init_db():
         c.execute("UPDATE brands    SET code=UPPER(SUBSTR(REPLACE(name,' ',''),1,8)) WHERE code IS NULL OR code=''")
         c.execute("UPDATE grades    SET code=UPPER(SUBSTR(REPLACE(name,' ',''),1,8)) WHERE code IS NULL OR code=''")
 
-        c.execute("UPDATE schema_version SET version=4")
+        # ── One-time data backfill (v5): only when upgrading from an older schema ──
+        if prev_version < 5:
+            # Rows already synced before delta-tracking existed have their full
+            # quantity on Shopify — mark it accounted so the next push doesn't
+            # re-add it as a delta.
+            c.execute("UPDATE inventory SET shopify_synced_qty=quantity "
+                      "WHERE shopify_status='synced' AND shopify_synced_qty=0 AND quantity>0")
+
+        # ── v6: rename single-letter grades to full names (Fresh unchanged) ──────
+        if prev_version < 6:
+            for _short, _full in (("A", "Grade A"), ("B", "Grade B")):
+                c.execute(
+                    "UPDATE grades SET name=? WHERE name=? COLLATE NOCASE "
+                    "AND NOT EXISTS (SELECT 1 FROM grades WHERE name=? COLLATE NOCASE)",
+                    (_full, _short, _full))
+
+        c.execute("UPDATE schema_version SET version=6")
+
+    # One-time backfills for legacy rows — only on upgrade, not every boot.
+    if prev_version < 5:
+        backfill_product_handles()
+        backfill_physical_from_specs()
+
+
+def backfill_physical_from_specs():
+    """Fill weight / packed dimensions from the specifications JSON for rows
+    that are missing them — covers records created before the parser handled
+    formats like '58D x 55W x 85H Centimeters'."""
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT id, specifications_json, weight_grams, packed_length "
+            "FROM inventory"
+        ).fetchall()
+        for r in rows:
+            try:
+                specs = json.loads(r["specifications_json"] or "{}")
+            except Exception:
+                specs = {}
+            phys = extract_physical_from_specs(specs)
+            sets, params = [], []
+            if r["weight_grams"] is None and phys["weight_grams"] is not None:
+                sets += ["weight_grams=?", "weight_unit=?"]
+                params += [phys["weight_grams"], phys["weight_unit"]]
+            if r["packed_length"] is None and phys["packed_length"] is not None:
+                sets += ["packed_length=?", "packed_width=?", "packed_height=?"]
+                params += [phys["packed_length"], phys["packed_width"], phys["packed_height"]]
+            if sets:
+                params.append(r["id"])
+                c.execute(f"UPDATE inventory SET {', '.join(sets)} WHERE id=?", params)
+
+
+def backfill_product_handles():
+    """Compute product_handle for any inventory rows missing one.
+
+    The handle is the SKU prefix (CATEGORY-BRAND-MODEL) shared by every variant
+    of the same product, so older records get a stable product id retroactively.
+    """
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT id, item_name, model_name, category_id, sub_category_id, brand_id "
+            "FROM inventory WHERE product_handle IS NULL OR product_handle=''"
+        ).fetchall()
+        if not rows:
+            return
+        abbr = [dict(r) for r in c.execute(
+            "SELECT name,code,priority FROM abbreviations WHERE active=1 ORDER BY priority DESC, length(name) DESC"
+        )]
+        cat_codes = {r["id"]: r["code"] for r in c.execute("SELECT id, code FROM categories")}
+        sub_codes = {r["id"]: r["code"] for r in c.execute("SELECT id, code FROM sub_categories")}
+        brand_codes = {r["id"]: r["code"] for r in c.execute("SELECT id, code FROM brands")}
+        for r in rows:
+            cat_code = sub_codes.get(r["sub_category_id"]) or cat_codes.get(r["category_id"])
+            brand_code = brand_codes.get(r["brand_id"])
+            if not cat_code or not brand_code:
+                continue
+            try:
+                handle = generate_product_handle(
+                    cat_code, brand_code, r["item_name"], r["model_name"] or "", abbr)
+            except ValueError:
+                continue
+            c.execute("UPDATE inventory SET product_handle=? WHERE id=?", (handle, r["id"]))
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -364,6 +464,8 @@ def preview_variants(item_name, model_name, category_id, sub_category_id, brand_
         sku_category_code = sub_cat["code"] if sub_cat else cat["code"]
         sku = generate_sku(sku_category_code, brand["code"], item_name, model_name,
                            grade["code"] if grade else "", combined_code, abbr)
+        product_handle = generate_product_handle(sku_category_code, brand["code"],
+                                                  item_name, model_name, abbr)
 
         existing = c.execute("SELECT * FROM inventory WHERE sku=? COLLATE NOCASE", (sku,)).fetchone()
         action   = "SKU exists — add to current stock" if existing else "New SKU — create inventory record"
@@ -385,6 +487,7 @@ def preview_variants(item_name, model_name, category_id, sub_category_id, brand_
 
         return [{
             "sku": sku,
+            "product_handle": product_handle,
             "colours": ", ".join(selected_names) if selected_names else "—",
             "colour_code": combined_code or "—",
             "quantity_to_add": int(quantity),
@@ -405,6 +508,14 @@ def save_inventory_variants(draft, actor):
             existing     = c.execute("SELECT * FROM inventory WHERE sku=? COLLATE NOCASE", (v["sku"],)).fetchone()
             cc_value     = v["colour_code"] if v["colour_code"] != "—" else ""
             colour_names = v.get("selected_colours", [])
+            # Per-variant fields (fall back to draft for backward compatibility)
+            v_grade_id  = v.get("grade_id",       draft.get("grade_id"))
+            v_qty       = v.get("quantity_to_add", draft.get("quantity", 1))
+            v_mrp       = v.get("mrp",             draft.get("mrp"))
+            v_purchase  = v.get("purchase_price",  draft.get("purchase_price"))
+            v_selling   = v.get("selling_price",   draft.get("selling_price"))
+            v_lot       = v.get("lot_number",      draft.get("lot_number"))
+            v_osp       = v.get("osp",             draft.get("osp"))
             if existing:
                 existing_colours = json.loads(existing["colours_json"] or "[]")
                 same = (
@@ -412,19 +523,23 @@ def save_inventory_variants(draft, actor):
                     and (existing["model_name"] or "").casefold() == draft["model_name"].casefold()
                     and existing["category_id"] == draft["category_id"]
                     and existing["brand_id"]    == draft["brand_id"]
-                    and existing["grade_id"]    == draft["grade_id"]
+                    and existing["grade_id"]    == v_grade_id
                     and existing["colour_code"] == cc_value
                     and sorted(existing_colours, key=str.casefold) == sorted(colour_names, key=str.casefold)
                 )
                 if not same:
                     raise ValueError(f"SKU {v['sku']} now conflicts with a different product.")
                 oldq = existing["quantity"]
-                c.execute("UPDATE inventory SET quantity=quantity+?,updated_at=?,modified_by=? WHERE id=?",
-                          (draft["quantity"], now(), _actor_name(actor), existing["id"]))
+                # A top-up on an already-synced variant flips only THAT variant to
+                # "modified" so the product shows as needing a re-push. Variants not
+                # yet synced keep their status (NULL/failed).
+                new_status = "modified" if existing["shopify_status"] == "synced" else existing["shopify_status"]
+                c.execute("UPDATE inventory SET quantity=quantity+?,shopify_status=?,updated_at=?,modified_by=? WHERE id=?",
+                          (v_qty, new_status, now(), _actor_name(actor), existing["id"]))
                 _audit(c, actor, "inventory", existing["id"], "quantity_increase",
-                       old={"quantity": oldq},
-                       new={"quantity": oldq + draft["quantity"], "sku": v["sku"]})
-                messages.append(f"{v['sku']}: quantity increased from {oldq} to {oldq + draft['quantity']}.")
+                       old={"quantity": oldq, "shopify_status": existing["shopify_status"]},
+                       new={"quantity": oldq + v_qty, "sku": v["sku"], "shopify_status": new_status})
+                messages.append(f"{v['sku']}: quantity increased from {oldq} to {oldq + v_qty}.")
             else:
                 t = now()
                 cur = c.execute("""
@@ -434,24 +549,34 @@ def save_inventory_variants(draft, actor):
                       lot_number,source_url,osp,capacity,capacity_unit,
                       amazon_asin,amazon_title,amazon_price,amazon_rating,amazon_reviews,
                       amazon_availability,description,amazon_about_this_item,
-                      specifications_json,images_json,created_at,updated_at,created_by)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      specifications_json,images_json,variant_image,product_handle,
+                      hs_code,warehouse_location,shopify_category,shopify_category_id,
+                      whats_in_the_box,weight_grams,weight_unit,
+                      packed_length,packed_width,packed_height,
+                      created_at,updated_at,created_by)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (draft["item_name"], draft["model_name"],
-                     draft["category_id"], draft.get("sub_category_id"), draft["brand_id"], draft["grade_id"],
+                     draft["category_id"], draft.get("sub_category_id"), draft["brand_id"], v_grade_id,
                      cc_value, json.dumps(colour_names),
-                     draft["quantity"], draft["mrp"], draft["purchase_price"], draft["selling_price"],
-                     v["sku"], draft.get("lot_number"), draft["source_url"],
-                     draft.get("osp"), draft.get("capacity"), draft.get("capacity_unit"),
+                     v_qty, v_mrp, v_purchase, v_selling,
+                     v["sku"], v_lot, draft.get("source_url"),
+                     v_osp, draft.get("capacity"), draft.get("capacity_unit"),
                      draft.get("amazon_asin"), draft.get("amazon_title"), draft.get("amazon_price"),
                      draft.get("amazon_rating"), draft.get("amazon_reviews"), draft.get("amazon_availability"),
                      draft.get("description"), draft.get("amazon_about_this_item"),
                      json.dumps(draft.get("specifications", {}), ensure_ascii=False),
                      json.dumps(draft.get("images", []), ensure_ascii=False),
+                     v.get("variant_image") or "",
+                     v.get("product_handle") or draft.get("product_handle"),
+                     v.get("hs_code") or None, v.get("warehouse_location") or None,
+                     draft.get("shopify_category") or None, draft.get("shopify_category_id") or None,
+                     draft.get("whats_in_the_box"), draft.get("weight_grams"), draft.get("weight_unit"),
+                     draft.get("packed_length"), draft.get("packed_width"), draft.get("packed_height"),
                      t, t, _actor_name(actor)))
                 _audit(c, actor, "inventory", cur.lastrowid, "create",
-                       new={"sku": v["sku"], "quantity": draft["quantity"], "colours": colour_names})
+                       new={"sku": v["sku"], "quantity": v_qty, "colours": colour_names})
                 messages.append(f"{v['sku']}: created for {', '.join(colour_names) if colour_names else 'no colour'} "
-                                 f"with quantity {draft['quantity']}.")
+                                 f"with quantity {v_qty}.")
     return messages
 
 def list_inventory():
@@ -479,6 +604,39 @@ def get_inventory_by_id(row_id):
         if not row: raise ValueError("Inventory record not found.")
         return dict(row)
 
+def get_product_by_handle(product_handle):
+    """Return the first existing inventory row for a product handle (product-level
+    content is shared across its variants), or None if the product is new."""
+    if not product_handle:
+        return None
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT * FROM inventory WHERE product_handle = ? COLLATE NOCASE "
+            "ORDER BY id LIMIT 1", (product_handle,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ── Shopify taxonomy (synced leaf categories for the dropdown) ──────────────────
+
+def replace_taxonomy(rows):
+    """Replace the stored Shopify taxonomy leaves with a fresh sync."""
+    with get_conn() as c:
+        c.execute("DELETE FROM taxonomy_categories")
+        c.executemany(
+            "INSERT OR REPLACE INTO taxonomy_categories(gid,name,full_name) VALUES(?,?,?)",
+            [(r["gid"], r["name"], r["full_name"]) for r in rows if r.get("gid")],
+        )
+
+def list_taxonomy_leaves():
+    with get_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT gid,name,full_name FROM taxonomy_categories ORDER BY name COLLATE NOCASE")]
+
+def taxonomy_count():
+    with get_conn() as c:
+        return c.execute("SELECT COUNT(*) FROM taxonomy_categories").fetchone()[0]
+
 def update_inventory(row_id, changes, actor):
     with get_conn() as c:
         row = c.execute("SELECT * FROM inventory WHERE id=?", (row_id,)).fetchone()
@@ -492,7 +650,10 @@ def update_inventory(row_id, changes, actor):
                 lot_number=?,source_url=?,osp=?,capacity=?,capacity_unit=?,
                 amazon_asin=?,amazon_title=?,amazon_price=?,amazon_rating=?,amazon_reviews=?,
                 amazon_availability=?,description=?,amazon_about_this_item=?,
-                specifications_json=?,images_json=?,updated_at=?,modified_by=?
+                specifications_json=?,images_json=?,variant_image=?,
+                whats_in_the_box=?,weight_grams=?,weight_unit=?,
+                packed_length=?,packed_width=?,packed_height=?,
+                updated_at=?,modified_by=?
             WHERE id=?""",
             (changes["item_name"], changes["model_name"],
              changes["quantity"], changes["mrp"], changes["purchase_price"], changes["selling_price"],
@@ -511,8 +672,69 @@ def update_inventory(row_id, changes, actor):
              changes.get("amazon_about_this_item", row["amazon_about_this_item"]),
              json.dumps(specs,   ensure_ascii=False),
              json.dumps(images,  ensure_ascii=False),
+             changes.get("variant_image", row.get("variant_image", "")),
+             changes.get("whats_in_the_box", row.get("whats_in_the_box")),
+             changes.get("weight_grams",     row.get("weight_grams")),
+             changes.get("weight_unit",      row.get("weight_unit")),
+             changes.get("packed_length",    row.get("packed_length")),
+             changes.get("packed_width",     row.get("packed_width")),
+             changes.get("packed_height",    row.get("packed_height")),
              now(), _actor_name(actor), row_id))
         _audit(c, actor, "inventory", row_id, "update", old=old, new=changes)
+
+
+def update_product_content(row_ids, changes, actor):
+    """Update product-level content shared across every variant of a product.
+
+    Description, About this item, What's inside the box, Specifications and the
+    source URL are the same for all variants, so they are written to every
+    inventory row that belongs to the product.
+    """
+    if not row_ids:
+        return
+    # When specifications are edited, re-derive weight & packed dimensions from them.
+    phys = {}
+    if changes.get("specifications") is not None:
+        phys = extract_physical_from_specs(changes["specifications"])
+    with get_conn() as c:
+        for rid in row_ids:
+            row = c.execute("SELECT * FROM inventory WHERE id=?", (rid,)).fetchone()
+            if not row:
+                continue
+            specs = changes.get("specifications")
+            specs_json = (json.dumps(specs, ensure_ascii=False)
+                          if specs is not None else row["specifications_json"])
+
+            def _phys_or_row(key):
+                if changes.get(key) is not None:
+                    return changes[key]
+                if phys.get(key) is not None:
+                    return phys[key]
+                return row[key]
+
+            c.execute("""
+                UPDATE inventory
+                SET model_name=?, capacity=?, capacity_unit=?,
+                    description=?, amazon_about_this_item=?, whats_in_the_box=?,
+                    specifications_json=?, source_url=?, shopify_category=?,
+                    weight_grams=?, weight_unit=?,
+                    packed_length=?, packed_width=?, packed_height=?,
+                    updated_at=?, modified_by=?
+                WHERE id=?""",
+                (changes.get("model_name",             row["model_name"]),
+                 changes.get("capacity",               row["capacity"]),
+                 changes.get("capacity_unit",          row["capacity_unit"]),
+                 changes.get("description",            row["description"]),
+                 changes.get("amazon_about_this_item", row["amazon_about_this_item"]),
+                 changes.get("whats_in_the_box",       row["whats_in_the_box"]),
+                 specs_json,
+                 changes.get("source_url",             row["source_url"]),
+                 changes.get("shopify_category",        row["shopify_category"]),
+                 _phys_or_row("weight_grams"),  _phys_or_row("weight_unit"),
+                 _phys_or_row("packed_length"), _phys_or_row("packed_width"),
+                 _phys_or_row("packed_height"),
+                 now(), _actor_name(actor), rid))
+            _audit(c, actor, "inventory", rid, "update_content", new=changes)
 
 
 # ── Audit ─────────────────────────────────────────────────────────────────────
@@ -643,22 +865,54 @@ def bulk_add_sub_categories(records, actor):
 # ── Suggestions ───────────────────────────────────────────────────────────────
 
 def inventory_suggestions(field, query=""):
-    """Return matching item/model names when query is 4+ characters."""
+    """Return distinct item/model names for autocomplete.
+    When query is empty, returns all values (for client-side filtering).
+    When query is provided, filters server-side."""
     if field not in ("item_name", "model_name"):
         raise ValueError("Unsupported suggestion field")
     with get_conn() as c:
         q = (query or "").strip()
-        if len(q) >= 4:
+        if q:
             return [r[0] for r in c.execute(
                 f"SELECT DISTINCT {field} FROM inventory "
                 f"WHERE TRIM(COALESCE({field},'')) <> '' AND {field} LIKE ? COLLATE NOCASE "
                 f"ORDER BY {field} COLLATE NOCASE LIMIT 10",
                 (f"%{q}%",)
             ).fetchall()]
-        return []
+        return [r[0] for r in c.execute(
+            f"SELECT DISTINCT {field} FROM inventory "
+            f"WHERE TRIM(COALESCE({field},'')) <> '' "
+            f"ORDER BY {field} COLLATE NOCASE LIMIT 200"
+        ).fetchall()]
 
 def sku_exists(sku):
     with get_conn() as c:
         return c.execute(
             "SELECT 1 FROM inventory WHERE sku=? COLLATE NOCASE", (sku,)
         ).fetchone() is not None
+
+
+def update_shopify_status(row_ids: list, status: str):
+    """Set the Shopify status for the given rows (used for 'failed'). Successful
+    syncs go through mark_synced(), which also advances shopify_synced_qty."""
+    if not row_ids:
+        return
+    with get_conn() as c:
+        c.executemany(
+            "UPDATE inventory SET shopify_status=?, shopify_pushed_at=? WHERE id=?",
+            [(status, now(), rid) for rid in row_ids],
+        )
+
+
+def mark_synced(id_to_qty: dict):
+    """Mark rows synced and advance shopify_synced_qty to the quantity that was
+    actually pushed (snapshotted at push time), so future top-ups push only the
+    new delta. Only call for variants whose Shopify inventory actually applied."""
+    if not id_to_qty:
+        return
+    with get_conn() as c:
+        c.executemany(
+            "UPDATE inventory SET shopify_status='synced', shopify_pushed_at=?, "
+            "shopify_synced_qty=? WHERE id=?",
+            [(now(), int(q), int(rid)) for rid, q in id_to_qty.items()],
+        )

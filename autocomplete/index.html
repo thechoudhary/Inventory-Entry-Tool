@@ -10,7 +10,6 @@ body {
   overflow: visible;
 }
 
-/* ── Label ─────────────────────────────── */
 .ac-label {
   display: block;
   font-size: 0.68rem;
@@ -24,7 +23,6 @@ body {
   text-overflow: ellipsis;
 }
 
-/* ── Input row ─────────────────────────── */
 .ac-input-row {
   position: relative;
 }
@@ -60,7 +58,6 @@ body {
 }
 .ac-clear:hover { color: #475569; }
 
-/* ── Dropdown ──────────────────────────── */
 .ac-dropdown {
   position: absolute;
   top: calc(100% + 5px);
@@ -74,33 +71,6 @@ body {
   display: none;
 }
 
-/* Loading state */
-.ac-loading {
-  padding: 12px 14px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  color: #64748b;
-  font-size: 12.5px;
-}
-.ac-spinner {
-  width: 14px; height: 14px; flex-shrink: 0;
-  border: 2px solid #e2e8f0;
-  border-top-color: #2563eb;
-  border-radius: 50%;
-  animation: spin 0.55s linear infinite;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-
-/* Empty */
-.ac-empty {
-  padding: 12px 14px;
-  color: #94a3b8;
-  font-size: 12.5px;
-  text-align: center;
-}
-
-/* Suggestion item */
 .ac-item {
   display: flex;
   align-items: center;
@@ -111,9 +81,7 @@ body {
   transition: background 0.1s;
 }
 .ac-item:last-child { border-bottom: none; }
-.ac-item:hover, .ac-item.active {
-  background: #eff6ff;
-}
+.ac-item:hover, .ac-item.active { background: #eff6ff; }
 .ac-item-icon {
   width: 30px; height: 30px; flex-shrink: 0;
   border-radius: 7px;
@@ -155,39 +123,57 @@ body {
 
 <script>
 (function () {
-  // ── State ──────────────────────────────────────────────────────────────────
   var inp         = document.getElementById('inp');
   var clr         = document.getElementById('clr');
   var drop        = document.getElementById('drop');
   var lbl         = document.getElementById('lbl');
 
-  var suggestions = [];   // current suggestions array from Python
-  var activeIdx   = -1;   // keyboard-selected row index
-  var dropVisible = false;
-  var isLoading   = false; // waiting for suggestions from Python
-  var debTimer    = null;
-  var lastSent    = '';    // last value sent to Streamlit
+  var allSuggestions = [];  // full list from Python — never changes during a page
+  var filtered       = [];  // client-side filtered view
+  var activeIdx      = -1;
+  var dropVisible    = false;
+  var lastSent       = null;  // last value posted to Python (dedup blur sends)
 
-  var DEBOUNCE_MS = 500;
-  var MIN_CHARS   = 4;
+  var MIN_CHARS = 2;
+  var MAX_SHOW  = 8;
 
-  // ── Streamlit messaging ────────────────────────────────────────────────────
+  // ── Streamlit helpers ──────────────────────────────────────────────────────
   function postMsg(type, payload) {
     window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, payload), '*');
   }
 
   function sendValue(text, selected) {
+    lastSent = text;
     postMsg('streamlit:setComponentValue', {
-      value: { text: text, selected: !!selected },
+      value: { text: text, selected: selected },
       dataType: 'json'
     });
   }
 
+  function sendSelected(text) {
+    sendValue(text, true);  // user picked a suggestion
+  }
+
   function resizeFrame() {
     var baseH = document.getElementById('root').getBoundingClientRect().height;
-    // When dropdown is visible, make room; absolute-positioned so doesn't affect scrollHeight
     var dropH = (dropVisible && drop.style.display !== 'none') ? (drop.scrollHeight + 6) : 0;
     postMsg('streamlit:setFrameHeight', { height: Math.max(58, Math.ceil(baseH + dropH + 2)) });
+  }
+
+  // ── Client-side filtering ─────────────────────────────────────────────────
+  function computeFiltered(query) {
+    if (!query || query.length < MIN_CHARS) return [];
+    var q = query.toLowerCase();
+    var starts = [], contains = [];
+    for (var i = 0; i < allSuggestions.length; i++) {
+      var s = allSuggestions[i];
+      if (!s) continue;
+      var sl = s.toLowerCase();
+      if (sl.startsWith(q)) starts.push(s);
+      else if (sl.indexOf(q) >= 0) contains.push(s);
+      if (starts.length + contains.length >= MAX_SHOW) break;
+    }
+    return starts.concat(contains).slice(0, MAX_SHOW);
   }
 
   // ── Highlight matching text ────────────────────────────────────────────────
@@ -206,28 +192,14 @@ body {
 
   // ── Render dropdown ────────────────────────────────────────────────────────
   function renderDrop() {
-    if (!dropVisible) {
+    if (!dropVisible || !filtered.length) {
       drop.style.display = 'none';
       resizeFrame();
       return;
     }
     drop.style.display = 'block';
-
-    if (isLoading) {
-      drop.innerHTML =
-        '<div class="ac-loading"><div class="ac-spinner"></div>Looking up suggestions…</div>';
-      resizeFrame();
-      return;
-    }
-
-    if (!suggestions.length) {
-      drop.innerHTML = '<div class="ac-empty">No matching suggestions</div>';
-      resizeFrame();
-      return;
-    }
-
     var q = inp.value.trim();
-    drop.innerHTML = suggestions.map(function (s, i) {
+    drop.innerHTML = filtered.map(function (s, i) {
       return '<div class="ac-item' + (i === activeIdx ? ' active' : '') + '" data-i="' + i + '">'
         + '<div class="ac-item-icon">📦</div>'
         + '<div class="ac-item-text">' + highlight(s, q) + '</div>'
@@ -238,60 +210,37 @@ body {
     drop.querySelectorAll('.ac-item').forEach(function (el) {
       el.addEventListener('mousedown', function (e) {
         e.preventDefault();
-        pick(suggestions[parseInt(el.dataset.i)]);
+        pick(filtered[parseInt(el.dataset.i)]);
       });
     });
-
     resizeFrame();
   }
 
   function pick(val) {
-    inp.value   = val;
+    inp.value = val;
     clr.style.display = 'block';
     dropVisible = false;
-    isLoading   = false;
-    suggestions = [];
+    filtered    = [];
     activeIdx   = -1;
     renderDrop();
-    sendValue(val, true);
+    sendSelected(val);  // only time we notify Python
   }
 
-  // ── Input events ───────────────────────────────────────────────────────────
+  // ── Input events — all filtering is local, no Python round-trips ──────────
   inp.addEventListener('input', function () {
     var v = inp.value;
     clr.style.display = v ? 'block' : 'none';
-    clearTimeout(debTimer);
-
-    if (v.length < MIN_CHARS) {
-      dropVisible = false;
-      isLoading   = false;
-      suggestions = [];
-      renderDrop();
-      if (v !== lastSent) {
-        lastSent = v;
-        sendValue(v, false);
-      }
-      return;
-    }
-
-    // Show loading immediately, debounce actual send
-    dropVisible = true;
-    isLoading   = true;
+    filtered    = computeFiltered(v);
     activeIdx   = -1;
+    dropVisible = filtered.length > 0;
     renderDrop();
-
-    debTimer = setTimeout(function () {
-      isLoading = false;   // will be updated when Python sends back suggestions
-      lastSent  = v;
-      sendValue(v, false);
-    }, DEBOUNCE_MS);
   });
 
   inp.addEventListener('keydown', function (e) {
-    if (!dropVisible || !suggestions.length) return;
+    if (!dropVisible || !filtered.length) return;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      activeIdx = Math.min(activeIdx + 1, suggestions.length - 1);
+      activeIdx = Math.min(activeIdx + 1, filtered.length - 1);
       renderDrop();
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
@@ -299,7 +248,7 @@ body {
       renderDrop();
     } else if (e.key === 'Enter' && activeIdx >= 0) {
       e.preventDefault();
-      pick(suggestions[activeIdx]);
+      pick(filtered[activeIdx]);
     } else if (e.key === 'Escape') {
       dropVisible = false;
       renderDrop();
@@ -310,12 +259,18 @@ body {
     setTimeout(function () {
       dropVisible = false;
       renderDrop();
+      // Commit typed text that was never picked from the dropdown, so Python
+      // captures free-form entries (e.g. a brand-new model name).
+      if (inp.value !== lastSent) {
+        sendValue(inp.value, false);
+      }
     }, 160);
   });
 
   inp.addEventListener('focus', function () {
-    if (suggestions.length && inp.value.length >= MIN_CHARS) {
-      dropVisible = true;
+    if (inp.value.length >= MIN_CHARS) {
+      filtered    = computeFiltered(inp.value);
+      dropVisible = filtered.length > 0;
       renderDrop();
     }
   });
@@ -324,56 +279,48 @@ body {
     inp.value   = '';
     clr.style.display = 'none';
     dropVisible = false;
-    isLoading   = false;
-    suggestions = [];
+    filtered    = [];
     activeIdx   = -1;
     renderDrop();
-    lastSent    = '';
-    sendValue('', false);
+    sendSelected('');
   });
 
-  // ── Streamlit → component messages ────────────────────────────────────────
+  // ── Streamlit → component ─────────────────────────────────────────────────
   window.addEventListener('message', function (event) {
     var msg = event.data || {};
     if (msg.type !== 'streamlit:render') return;
     var args = msg.args || {};
 
-    // Label / placeholder
     var newLabel = args.label || '';
     if (lbl.textContent !== newLabel) lbl.textContent = newLabel;
     var ph = args.placeholder || '';
     if (inp.placeholder !== ph) inp.placeholder = ph;
 
-    // Value: only update input if Python is pushing a new value (e.g. on form reset)
+    // Update full suggestion list from Python (happens once on load / after selection)
+    var newAll = Array.isArray(args.suggestions) ? args.suggestions : [];
+    if (newAll.length !== allSuggestions.length) {
+      allSuggestions = newAll;
+    }
+
+    // Sync value from Python — but never overwrite user's typed text with empty.
+    // Python sends value="" until user selects a suggestion; don't wipe what user typed.
     var pythonVal = args.value !== undefined ? String(args.value) : null;
     if (pythonVal !== null && pythonVal !== inp.value) {
-      inp.value         = pythonVal;
-      clr.style.display = pythonVal ? 'block' : 'none';
-      // If input was cleared by form reset, close dropdown
-      if (!pythonVal) {
-        dropVisible = false;
-        isLoading   = false;
-        suggestions = [];
+      if (pythonVal || !inp.value) {   // only update if Python has content OR input is empty
+        inp.value         = pythonVal;
+        clr.style.display = pythonVal ? 'block' : 'none';
+        if (!pythonVal) {
+          dropVisible = false;
+          filtered    = [];
+        }
+        renderDrop();
       }
     }
-
-    // Suggestions from Python
-    var newSuggs = Array.isArray(args.suggestions) ? args.suggestions : [];
-    var changed  = JSON.stringify(newSuggs) !== JSON.stringify(suggestions);
-    if (changed) {
-      suggestions = newSuggs;
-      activeIdx   = -1;
-      isLoading   = false;
-      // Only open drop if input still has enough chars
-      if (inp.value.length >= MIN_CHARS) {
-        dropVisible = true;
-      }
-    }
-
-    renderDrop();
+    // Seed the dedup baseline once so an untouched field never posts on blur.
+    if (lastSent === null) lastSent = inp.value || '';
   });
 
-  // ── Init ───────────────────────────────────────────────────────────────────
+  // ── Init ──────────────────────────────────────────────────────────────────
   postMsg('streamlit:componentReady', { apiVersion: 1 });
   postMsg('streamlit:setFrameHeight', { height: 58 });
 
