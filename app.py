@@ -13,7 +13,7 @@ from db import (
     update_inventory, get_inventory_by_id, get_product_by_handle, audit_rows,
     change_password, admin_count, deactivate_master, inventory_suggestions,
     list_sub_categories, update_shopify_status, update_product_content, mark_synced,
-    list_taxonomy_leaves, taxonomy_count, replace_taxonomy,
+    list_taxonomy_leaves, taxonomy_count, replace_taxonomy, search_taxonomy,
 )
 from sku import generate_sku, colour_code, extract_physical_from_specs
 from urllib.parse import urlparse
@@ -163,16 +163,16 @@ def _sync_taxonomy_from_dataset():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _taxonomy_options():
-    """Cached dropdown options for Shopify leaf categories: list of
-    (label, name, gid). Duplicate leaf names are disambiguated by full path."""
-    from collections import Counter
-    leaves = list_taxonomy_leaves()
-    cnt = Counter(l["name"] for l in leaves)
-    opts = []
-    for l in leaves:
-        label = l["name"] if cnt[l["name"]] == 1 else f"{l['name']}  ·  {l['full_name']}"
-        opts.append((label, l["name"], l["gid"]))
-    return opts
+    """Cached dropdown options for the Shopify category field — ONE entry per
+    unique last-node name. Returns (names_sorted, {name: (gid, full_name)}).
+    Duplicate leaf names collapse to the shortest (most general) full path."""
+    best = {}
+    for l in list_taxonomy_leaves():
+        n = l["name"]
+        if n not in best or len(l["full_name"]) < len(best[n][1]):
+            best[n] = (l["gid"], l["full_name"])
+    names = sorted(best.keys(), key=str.casefold)
+    return names, best
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1194,21 +1194,20 @@ elif page == "Add Inventory":
     item_name  = _ac_field(ai1, "item_name",  "Item Name *", "e.g. Washing Machine, Air Cooler")
     model_name = _ac_field(ai2, "model_name", "Model Name",  "e.g. Magic Clean 8kg, MAGCLE80")
 
-    # Shopify category (leaf) — mandatory dropdown of Shopify's taxonomy last-nodes.
-    _tax_opts = _taxonomy_options()
-    _TAX_PLACEHOLDER = "— Select Shopify category * —"
-    if not _tax_opts:
+    # Shopify category (leaf) — single mandatory dropdown of last-node names.
+    shopify_category, shopify_category_id = "", ""
+    if taxonomy_count() == 0:
         st.warning("Shopify taxonomy isn't synced yet — an admin can sync it in **Manage → Shopify Taxonomy**.")
-        shopify_category, shopify_category_id = "", ""
     else:
-        _tax_labels = [_TAX_PLACEHOLDER] + [o[0] for o in _tax_opts]
-        _sel_label  = st.selectbox("Shopify Category (last node) *", _tax_labels, key=f"shopcat_{fc}",
-                                   help="Pick the last node; the full taxonomy path is sent to Shopify on push.")
-        if _sel_label != _TAX_PLACEHOLDER:
-            _o = _tax_opts[_tax_labels.index(_sel_label) - 1]
-            shopify_category, shopify_category_id = _o[1], _o[2]
-        else:
-            shopify_category, shopify_category_id = "", ""
+        _names, _name_map = _taxonomy_options()
+        _TAX_PLACEHOLDER = "— Select Shopify category * —"
+        _sel = st.selectbox("Shopify Category (last node) *", [_TAX_PLACEHOLDER] + _names,
+                            key=f"shopcat_{fc}",
+                            help="Type to filter. The full taxonomy path is sent to Shopify on push.")
+        if _sel != _TAX_PLACEHOLDER:
+            shopify_category_id, _full = _name_map[_sel]
+            shopify_category = _sel
+            st.caption(f"✅ {_full}")
 
     # ── PRODUCT CLASSIFICATION ────────────────────────────────────────────────
     sec("PRODUCT CLASSIFICATION")
@@ -1264,8 +1263,8 @@ elif page == "Add Inventory":
         vb5.number_input("OSP (₹)",      min_value=0.0, step=1.0, value=0.0, key=f"v_osp_{rid}_{fc}")
         vc1, vc2 = st.columns(2)
         vc1.text_input("HS Code", placeholder="6-digit (optional)", max_chars=10, key=f"v_hs_{rid}_{fc}")
-        vc2.selectbox("Warehouse Location", ["Select", "BS01-Retail", "BS01-WH01", "BS01-WH02"],
-                      key=f"v_wh_{rid}_{fc}")
+        vc2.selectbox("Warehouse Location *", ["BS01-Retail", "BS01-WH01", "BS01-WH02"],
+                      index=1, key=f"v_wh_{rid}_{fc}")
 
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
     if st.button("＋  Add variant", key=f"v_add_{fc}"):
@@ -1296,7 +1295,7 @@ elif page == "Add Inventory":
             "selling":          float(st.session_state.get(f"v_sell_{_r}_{fc}", 0.0) or 0.0),
             "osp":              float(st.session_state.get(f"v_osp_{_r}_{fc}", 0.0) or 0.0),
             "hs_code":          (st.session_state.get(f"v_hs_{_r}_{fc}", "") or "").strip(),
-            "warehouse_location": (lambda _w: _w if _w != "Select" else "")(st.session_state.get(f"v_wh_{_r}_{fc}", "Select")),
+            "warehouse_location": st.session_state.get(f"v_wh_{_r}_{fc}", "BS01-WH01"),
         }
         for _r in _vrow_ids_now
     ]

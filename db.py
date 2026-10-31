@@ -637,6 +637,22 @@ def taxonomy_count():
     with get_conn() as c:
         return c.execute("SELECT COUNT(*) FROM taxonomy_categories").fetchone()[0]
 
+def search_taxonomy(query, limit=50):
+    """Server-side search of stored Shopify leaf categories by name or full path.
+    Returns up to `limit` matches, leaf-name matches first."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{q}%"
+    starts = f"{q}%"
+    with get_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT gid, name, full_name FROM taxonomy_categories "
+            "WHERE name LIKE ? COLLATE NOCASE OR full_name LIKE ? COLLATE NOCASE "
+            "ORDER BY (name LIKE ? COLLATE NOCASE) DESC, LENGTH(full_name), name COLLATE NOCASE "
+            "LIMIT ?",
+            (like, like, starts, limit))]
+
 def update_inventory(row_id, changes, actor):
     with get_conn() as c:
         row = c.execute("SELECT * FROM inventory WHERE id=?", (row_id,)).fetchone()
