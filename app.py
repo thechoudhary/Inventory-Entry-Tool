@@ -28,19 +28,32 @@ autocomplete_component = components.declare_component(
 )
 
 st.set_page_config(page_title="Inventory & SKU Manager", page_icon="📦", layout="wide")
-init_db()
+
+@st.cache_resource(show_spinner=False)
+def _initialize_database_once():
+    # Streamlit reruns this module after every widget interaction. Schema setup
+    # issues many remote MySQL requests, so initialize once per server process.
+    init_db()
+    return True
+
+_initialize_database_once()
 
 # ── Auto-seed admin from Streamlit secrets (Cloud deployment) ─────────────
 # Set [admin] username and password in the Streamlit Cloud secrets manager.
 # On a fresh DB the admin is created automatically; no setup_admin.py needed.
-try:
-    _sec = st.secrets.get("admin", {})
-    _su, _sp = _sec.get("username", ""), _sec.get("password", "")
-    if _su and _sp and admin_count() == 0:
-        from db import create_initial_admin
-        create_initial_admin(_su, _sp)
-except Exception:
-    pass  # secrets not configured or admin already exists — ignore silently
+@st.cache_resource(show_spinner=False)
+def _seed_admin_once():
+    try:
+        sec = st.secrets.get("admin", {})
+        username, password = sec.get("username", ""), sec.get("password", "")
+        if username and password and admin_count() == 0:
+            from db import create_initial_admin
+            create_initial_admin(username, password)
+    except Exception:
+        pass  # secrets not configured or admin already exists — ignore silently
+    return True
+
+_seed_admin_once()
 
 # ── ScraperAPI key (needed on Streamlit Cloud to bypass Amazon IP blocks) ─────
 # Add SCRAPERAPI_KEY = "your_key" to Streamlit Cloud secrets.
@@ -132,6 +145,34 @@ def require_admin():
 
 def master_options(kind): return list_master(kind, active_only=True)
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_master(kind):
+    return list_master(kind, active_only=True)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_sub_categories(category_id):
+    return list_sub_categories(category_id=category_id, active_only=True)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_inventory_suggestions(field):
+    return inventory_suggestions(field)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_taxonomy_count():
+    return taxonomy_count()
+
+
+def _clear_add_inventory_caches():
+    _cached_master.clear()
+    _cached_sub_categories.clear()
+    _cached_inventory_suggestions.clear()
+    _cached_taxonomy_count.clear()
+    _taxonomy_options.clear()
+
 def option_labels(rows): return ["Select"] + [r["name"] for r in rows]
 
 
@@ -158,6 +199,7 @@ def _sync_taxonomy_from_dataset():
               for c in allcats if not c.get("children")]
     replace_taxonomy(leaves)
     _taxonomy_options.clear()
+    _cached_taxonomy_count.clear()
     return len(leaves)
 
 
@@ -300,12 +342,13 @@ def normalize_amazon_data(data):
     packed_height = _phys["packed_height"]
 
     # Parse what's in the box
-    whats_in_the_box = ""
-    for bkey in ("Included Components", "What's in the box", "In the Box", "Box Contents", "Whats in the box"):
-        val = specs.get(bkey) or ""
-        if val:
-            whats_in_the_box = str(val)
-            break
+    whats_in_the_box = str(data.get("whats_in_the_box") or "").strip()
+    if not whats_in_the_box:
+        for bkey in ("Included Components", "What's in the box", "In the Box", "Box Contents", "Whats in the box"):
+            val = specs.get(bkey) or ""
+            if val:
+                whats_in_the_box = str(val)
+                break
 
     return {
         "amazon_asin":            str(data.get("asin", "")         or ""),
@@ -700,17 +743,44 @@ if page == "Dashboard":
     page_header("Dashboard", "Overview of your inventory.")
     inv = list_inventory()
     df  = pd.DataFrame(inv)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Inventory Records", len(df))
-    c2.metric("Total Units",   int(df["quantity"].sum()) if not df.empty else 0)
-    c3.metric("Unique SKUs",   df["sku"].nunique()       if not df.empty else 0)
-    c4.metric("Zero-stock",    int((df["quantity"]==0).sum()) if not df.empty else 0)
+
+    # Admins can scope the dashboard to one inventory creator. Standard users
+    # only see their own report when using the dashboard.
+    report_user = "All users"
+    if is_admin():
+        user_names = sorted({str(row["username"]) for row in list_users()})
+        report_user = st.selectbox("Dashboard report", ["All users"] + user_names,
+                                   key="dashboard_report_user")
+    else:
+        report_user = str(user.get("username", ""))
+
+    report_df = df
+    if not df.empty and report_user != "All users" and "created_by" in df.columns:
+        report_df = df[df["created_by"].fillna("").astype(str) == report_user]
+
+    today_local = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    if not report_df.empty and "created_at" in report_df.columns:
+        created_local = pd.to_datetime(report_df["created_at"], errors="coerce", utc=True).dt.tz_convert("Asia/Kolkata")
+        today_rows = report_df[created_local.dt.date == today_local]
+        product_ids = today_rows.get("product_handle", pd.Series(index=today_rows.index, dtype="object"))
+        product_ids = product_ids.fillna("").astype(str)
+        product_ids = product_ids.where(product_ids.str.strip() != "", "inventory:" + today_rows["id"].astype(str))
+        products_added_today = int(product_ids.nunique())
+    else:
+        products_added_today = 0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Inventory Records", len(report_df))
+    c2.metric("Total Units",   int(report_df["quantity"].sum()) if not report_df.empty else 0)
+    c3.metric("Unique SKUs",   report_df["sku"].nunique() if not report_df.empty else 0)
+    c4.metric("Products Added Today", products_added_today)
+    c5.metric("Zero-stock",    int((report_df["quantity"]==0).sum()) if not report_df.empty else 0)
 
     sec("RECENT ACTIVITY")
-    if df.empty:
+    if report_df.empty:
         st.info("No inventory yet. Use **Add Inventory** to create your first item.")
     else:
-        recent = df.sort_values("updated_at", ascending=False).head(10)
+        recent = report_df.sort_values("updated_at", ascending=False).head(10)
         show   = [c for c in ["sku","item_name","brand","sub_category","category","quantity",
                                "selling_price","created_by","modified_by","updated_at"]
                   if c in recent.columns]
@@ -1155,10 +1225,10 @@ elif page == "Inventory":
 elif page == "Add Inventory":
     page_header("Add Inventory", "Fill in product details, then fetch Amazon data and confirm to save.")
 
-    cats    = master_options("categories")
-    brands  = master_options("brands")
-    grades  = master_options("grades")
-    colours = master_options("colours")
+    cats    = _cached_master("categories")
+    brands  = _cached_master("brands")
+    grades  = _cached_master("grades")
+    colours = _cached_master("colours")
     if not cats or not brands:
         st.warning("An administrator must add at least one active category and brand in **Manage** before inventory can be added.")
 
@@ -1173,7 +1243,7 @@ elif page == "Add Inventory":
 
     def _ac_field(col, key_name, label, placeholder):
         cur_text  = st.session_state.get(f"{key_name}_{fc}", "")
-        all_suggs = inventory_suggestions(key_name)   # full list — JS filters locally
+        all_suggs = _cached_inventory_suggestions(key_name)   # full list — JS filters locally
         with col:
             val = autocomplete_component(
                 label=label, placeholder=placeholder,
@@ -1196,7 +1266,7 @@ elif page == "Add Inventory":
 
     # Shopify category (leaf) — single mandatory dropdown of last-node names.
     shopify_category, shopify_category_id = "", ""
-    if taxonomy_count() == 0:
+    if _cached_taxonomy_count() == 0:
         st.warning("Shopify taxonomy isn't synced yet — an admin can sync it in **Manage → Shopify Taxonomy**.")
     else:
         _names, _name_map = _taxonomy_options()
@@ -1214,7 +1284,7 @@ elif page == "Add Inventory":
     ac1, ac2, ac3, ac4, ac5 = st.columns(5)
     category_name   = ac1.selectbox("Category *",   option_labels(cats),  key=f"cat_{fc}")
     selected_cat_id = selected_id(cats, category_name)
-    sub_cats        = list_sub_categories(category_id=selected_cat_id, active_only=True) if selected_cat_id else []
+    sub_cats        = _cached_sub_categories(selected_cat_id) if selected_cat_id else []
     if not sub_cats:
         sub_cat_name = ac2.selectbox(
             "Sub-category",
@@ -1700,6 +1770,7 @@ elif page == "Add Inventory":
                     })
 
                 result = save_inventory_variants(draft, user)
+                _clear_add_inventory_caches()
                 for msg in result: st.success(msg)
                 st.session_state.pop("add_preview", None)
                 st.session_state.add_form_counter = fc + 1
@@ -1769,6 +1840,7 @@ elif page == "Manage":
             if not name.strip(): raise ValueError("Name is required.")
             if not code:         raise ValueError("Code is required.")
             add_master(kind, name.strip(), code, int(priority), user, parent_id=parent_id_add)
+            _clear_add_inventory_caches()
             st.success("Record added.")
             rerun()
         except Exception as e:
@@ -1800,6 +1872,7 @@ elif page == "Manage":
                         results = bulk_add_sub_categories(import_df.to_dict(orient="records"), user)
                     else:
                         results = bulk_add_master(kind, import_df.to_dict(orient="records"), user)
+                    _clear_add_inventory_caches()
                     result_df = pd.DataFrame(results)
                     imported  = int((result_df["status"]=="Imported").sum()) if not result_df.empty else 0
                     skipped   = int((result_df["status"]=="Skipped").sum()) if not result_df.empty else 0
@@ -1843,6 +1916,7 @@ elif page == "Manage":
             if upd_btn:
                 try:
                     update_master(kind, row["id"], new_name.strip(), new_code.strip().upper(), active, user, parent_id=new_parent_id)
+                    _clear_add_inventory_caches()
                     st.success("Record updated.")
                     rerun()
                 except Exception as e:

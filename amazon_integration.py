@@ -123,6 +123,7 @@ async def extract_amazon_product(product_url, proxy_api_key=None):
         "availability": "",
         "description": "",
         "amazon_about_this_item": "",
+        "whats_in_the_box": "",
         "specifications": {},
         "images": [],
         "error": "",
@@ -259,6 +260,19 @@ async def extract_amazon_product(product_url, proxy_api_key=None):
                 about_items,
                 ensure_ascii=False
             )
+
+            # Amazon product pages expose this section separately from the
+            # technical details table on some listings (including the
+            # post-purchase included-components deck).
+            try:
+                box_items = await page.locator(
+                    "#whatsInTheBoxDeck #witb-content-list li .a-list-item"
+                ).all_inner_texts()
+                product["whats_in_the_box"] = "\n".join(
+                    text.strip() for text in box_items if text and text.strip()
+                )
+            except Exception:
+                logger.debug("Could not read Amazon 'What is in the box?' section", exc_info=True)
 
             product["specifications"] = await get_spec(page)
             product["images"] = await scrape_images_from_page(page)

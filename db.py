@@ -1,95 +1,175 @@
-import sqlite3, os, json, re
-from pathlib import Path
+import os, json, re
+import base64
 from datetime import datetime, timezone
 from hashlib import scrypt
 import hmac
+import streamlit as st
+import pymysql
+from pymysql.cursors import DictCursor
 from sku import generate_sku, colour_code, generate_product_handle, extract_physical_from_specs
 
-def _default_db_path():
-    # Streamlit Cloud mounts the app in a read-only directory; /tmp is always writable.
-    # Locally the DB sits next to this file (original behaviour).
-    if os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_STREAMLIT_CLOUD"):
-        return Path("/tmp/inventory.db")
-    return Path(__file__).with_name("inventory.db")
+class _Row(dict):
+    """Mapping row that also preserves sqlite-style numeric column access."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            key = tuple(self.keys())[key]
+        return super().__getitem__(key)
 
-DB_PATH = Path(os.environ.get("INVENTORY_DB_PATH", _default_db_path()))
+
+class _Cursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = cursor.lastrowid
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return _Row(row) if row is not None else None
+
+    def fetchall(self):
+        return [_Row(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _Connection:
+    """Small DB-API wrapper retaining the execute API used throughout db.py."""
+    def __init__(self, connection):
+        self._connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._connection.commit()
+            else:
+                self._connection.rollback()
+        finally:
+            self._connection.close()
+
+    @staticmethod
+    def _sql(query):
+        query = re.sub(r"\s+COLLATE\s+NOCASE\b", "", query, flags=re.I)
+        query = query.replace("INSERT OR REPLACE INTO taxonomy_categories(gid,name,full_name) VALUES(?,?,?)",
+            "INSERT INTO taxonomy_categories(gid,name,full_name) VALUES(?,?,?) "
+            "ON DUPLICATE KEY UPDATE name=VALUES(name), full_name=VALUES(full_name)")
+        return query.replace("?", "%s")
+
+    def execute(self, query, params=None):
+        cursor = self._connection.cursor()
+        cursor.execute(self._sql(query), params or ())
+        return _Cursor(cursor)
+
+    def executemany(self, query, params):
+        cursor = self._connection.cursor()
+        cursor.executemany(self._sql(query), params)
+        return _Cursor(cursor)
+
+
+def _db_config():
+    try:
+        cfg = st.secrets.get("mysql", {})
+    except Exception:
+        cfg = {}
+    cfg = dict(cfg)
+    # Environment overrides make local CLI and deployment configuration convenient.
+    return {
+        "host": os.environ.get("MYSQL_HOST", cfg.get("host", "inventory-db.c7g2sq0e88r0.ap-southeast-2.rds.amazonaws.com")),
+        "port": int(os.environ.get("MYSQL_PORT", cfg.get("port", 3306))),
+        "database": os.environ.get("MYSQL_DATABASE", cfg.get("database", "inventory")),
+        "user": os.environ.get("MYSQL_USER", cfg.get("username", "")),
+        "password": os.environ.get("MYSQL_PASSWORD", cfg.get("password", "")),
+        "connect_timeout": 10,
+        "read_timeout": 30,
+        "write_timeout": 30,
+        "charset": "utf8mb4",
+        "cursorclass": DictCursor,
+        "autocommit": False,
+    }
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    return conn
+    cfg = _db_config()
+    if not cfg["user"] or not cfg["password"] or not cfg["database"]:
+        raise RuntimeError("Configure [mysql] username, password, and database in .streamlit/secrets.toml.")
+    return _Connection(pymysql.connect(**cfg))
+
+
+_TABLE_DDL = [
+    "CREATE TABLE IF NOT EXISTS schema_version(version INT NOT NULL)",
+    """CREATE TABLE IF NOT EXISTS users(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, username VARCHAR(40) NOT NULL UNIQUE,
+      password_hash VARCHAR(160) NOT NULL, role VARCHAR(16) NOT NULL,
+      active TINYINT NOT NULL DEFAULT 1, created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+      created_by VARCHAR(255), modified_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_ci""",
+    """CREATE TABLE IF NOT EXISTS categories(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL UNIQUE,
+      code VARCHAR(64) NOT NULL UNIQUE, active TINYINT NOT NULL DEFAULT 1,
+      created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+      created_by VARCHAR(255), modified_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_ci""",
+    """CREATE TABLE IF NOT EXISTS sub_categories(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL UNIQUE,
+      code VARCHAR(64) NOT NULL UNIQUE, parent_id BIGINT NOT NULL,
+      active TINYINT NOT NULL DEFAULT 1, created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+      created_by VARCHAR(255), modified_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_ci""",
+    """CREATE TABLE IF NOT EXISTS brands(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL UNIQUE,
+      code VARCHAR(64) NOT NULL UNIQUE, active TINYINT NOT NULL DEFAULT 1,
+      created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+      created_by VARCHAR(255), modified_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_ci""",
+    """CREATE TABLE IF NOT EXISTS grades(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL UNIQUE,
+      code VARCHAR(64) NOT NULL UNIQUE, active TINYINT NOT NULL DEFAULT 1,
+      created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+      created_by VARCHAR(255), modified_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_ci""",
+    """CREATE TABLE IF NOT EXISTS colours(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL UNIQUE,
+      code VARCHAR(64) NOT NULL UNIQUE, active TINYINT NOT NULL DEFAULT 1,
+      created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+      created_by VARCHAR(255), modified_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_ci""",
+    """CREATE TABLE IF NOT EXISTS abbreviations(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL UNIQUE, code VARCHAR(64) NOT NULL,
+      priority INT NOT NULL DEFAULT 0, active TINYINT NOT NULL DEFAULT 1,
+      created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+      created_by VARCHAR(255), modified_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_ci""",
+    """CREATE TABLE IF NOT EXISTS inventory(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, item_name VARCHAR(255) NOT NULL, model_name VARCHAR(255) NOT NULL DEFAULT '',
+      category_id BIGINT NOT NULL, sub_category_id BIGINT NULL, brand_id BIGINT NOT NULL, grade_id BIGINT NULL,
+      colour_code VARCHAR(255) NOT NULL DEFAULT '', colours_json LONGTEXT NOT NULL,
+      quantity INT NOT NULL DEFAULT 0, mrp DOUBLE NULL, purchase_price DOUBLE NULL, selling_price DOUBLE NULL,
+      sku VARCHAR(255) NOT NULL UNIQUE, lot_number VARCHAR(255), source_url TEXT, osp DOUBLE NULL,
+      capacity INT NULL, capacity_unit VARCHAR(32), amazon_asin VARCHAR(64), amazon_title TEXT, amazon_price TEXT,
+      amazon_rating VARCHAR(64), amazon_reviews VARCHAR(64), amazon_availability TEXT, description LONGTEXT,
+      amazon_about_this_item LONGTEXT, specifications_json LONGTEXT NOT NULL, images_json LONGTEXT NOT NULL,
+      created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL, created_by VARCHAR(255), modified_by VARCHAR(255),
+      whats_in_the_box LONGTEXT, weight_grams DOUBLE NULL, weight_unit VARCHAR(32), packed_length DOUBLE NULL,
+      packed_width DOUBLE NULL, packed_height DOUBLE NULL, shopify_status VARCHAR(32), shopify_pushed_at VARCHAR(40),
+      shopify_synced_qty INT NOT NULL DEFAULT 0, variant_image TEXT, product_handle VARCHAR(255), hs_code VARCHAR(32),
+      warehouse_location VARCHAR(255), shopify_category VARCHAR(255), shopify_category_id VARCHAR(255),
+      INDEX idx_inventory_sku(sku), INDEX idx_inventory_name(item_name,model_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    """CREATE TABLE IF NOT EXISTS audit_log(
+      id BIGINT PRIMARY KEY AUTO_INCREMENT, user_id BIGINT NULL, username VARCHAR(255), entity_type VARCHAR(64) NOT NULL,
+      entity_id BIGINT NULL, action VARCHAR(64) NOT NULL, old_value LONGTEXT, new_value LONGTEXT,
+      created_at VARCHAR(40) NOT NULL, created_by VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    """CREATE TABLE IF NOT EXISTS taxonomy_categories(
+      gid VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL, full_name TEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+]
+
+
+def _table_columns(c, table):
+    return {r["COLUMN_NAME"] for r in c.execute(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?", (table,))}
 
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_conn() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS users(
-          id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','standard')),
-          active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE TABLE IF NOT EXISTS categories(
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          code TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE TABLE IF NOT EXISTS sub_categories(
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          code TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          parent_id INTEGER NOT NULL REFERENCES categories(id),
-          active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE TABLE IF NOT EXISTS brands(
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          code TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE TABLE IF NOT EXISTS grades(
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          code TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE TABLE IF NOT EXISTS colours(
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          code TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE TABLE IF NOT EXISTS abbreviations(
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, code TEXT NOT NULL,
-          priority INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE TABLE IF NOT EXISTS inventory(
-          id INTEGER PRIMARY KEY, item_name TEXT NOT NULL, model_name TEXT NOT NULL DEFAULT '',
-          category_id INTEGER NOT NULL REFERENCES categories(id),
-          sub_category_id INTEGER REFERENCES sub_categories(id),
-          brand_id INTEGER NOT NULL REFERENCES brands(id),
-          grade_id INTEGER REFERENCES grades(id), colour_code TEXT NOT NULL DEFAULT '',
-          colours_json TEXT NOT NULL DEFAULT '[]', quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity>=0),
-          mrp REAL, purchase_price REAL, selling_price REAL, sku TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          lot_number TEXT, source_url TEXT, osp REAL, capacity INTEGER, capacity_unit TEXT,
-          amazon_asin TEXT, amazon_title TEXT, amazon_price TEXT, amazon_rating TEXT,
-          amazon_reviews TEXT, amazon_availability TEXT, description TEXT,
-          amazon_about_this_item TEXT, specifications_json TEXT NOT NULL DEFAULT '{}',
-          images_json TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          created_by TEXT, modified_by TEXT);
-        CREATE INDEX IF NOT EXISTS idx_inventory_sku ON inventory(sku);
-        CREATE INDEX IF NOT EXISTS idx_inventory_name ON inventory(item_name, model_name);
-        CREATE TABLE IF NOT EXISTS audit_log(
-          id INTEGER PRIMARY KEY, user_id INTEGER, username TEXT, entity_type TEXT NOT NULL,
-          entity_id INTEGER, action TEXT NOT NULL, old_value TEXT, new_value TEXT,
-          created_at TEXT NOT NULL, created_by TEXT);
-        CREATE TABLE IF NOT EXISTS taxonomy_categories(
-          gid TEXT PRIMARY KEY, name TEXT NOT NULL, full_name TEXT NOT NULL);
-        """)
+        for statement in _TABLE_DDL:
+            c.execute(statement)
 
         row = c.execute("SELECT COUNT(*) AS n FROM schema_version").fetchone()
         if row["n"] == 0:
@@ -98,66 +178,48 @@ def init_db():
         prev_version = _ver_row["version"] if _ver_row else 0
 
         # ── Non-destructive column migrations ────────────────────────────────
-        inv_cols = {r["name"] for r in c.execute("PRAGMA table_info(inventory)")}
+        inv_cols = _table_columns(c, "inventory")
 
         # Rename ost → osp
         if "ost" in inv_cols and "osp" not in inv_cols:
-            c.execute("ALTER TABLE inventory RENAME COLUMN ost TO osp")
+            c.execute("ALTER TABLE inventory CHANGE COLUMN ost osp DOUBLE NULL")
             inv_cols.discard("ost")
             inv_cols.add("osp")
 
         # Core inventory columns that may not exist in older databases
         for col, defn in [
-            ("lot_number",             "TEXT"),
-            ("source_url",             "TEXT"),
-            ("colours_json",           "TEXT NOT NULL DEFAULT '[]'"),
-            ("updated_at",             "TEXT NOT NULL DEFAULT ''"),
-            ("osp",                    "REAL"),
-            ("capacity",               "INTEGER"),
-            ("capacity_unit",          "TEXT"),
-            ("amazon_asin",            "TEXT"),
-            ("amazon_title",           "TEXT"),
-            ("amazon_price",           "TEXT"),
-            ("amazon_rating",          "TEXT"),
-            ("amazon_reviews",         "TEXT"),
-            ("amazon_availability",    "TEXT"),
-            ("description",            "TEXT"),
-            ("amazon_about_this_item", "TEXT"),
-            ("specifications_json",    "TEXT NOT NULL DEFAULT '{}'"),
-            ("images_json",            "TEXT NOT NULL DEFAULT '[]'"),
-            ("sub_category_id",        "INTEGER REFERENCES sub_categories(id)"),
-            ("created_by",             "TEXT"),
-            ("modified_by",            "TEXT"),
-            ("whats_in_the_box",       "TEXT"),
-            ("weight_grams",           "REAL"),
-            ("weight_unit",            "TEXT"),
-            ("packed_length",          "REAL"),
-            ("packed_width",           "REAL"),
-            ("packed_height",          "REAL"),
-            ("shopify_status",         "TEXT"),
-            ("shopify_pushed_at",      "TEXT"),
-            ("shopify_synced_qty",     "INTEGER NOT NULL DEFAULT 0"),
-            ("variant_image",          "TEXT"),
-            ("product_handle",         "TEXT"),
-            ("hs_code",                "TEXT"),
-            ("warehouse_location",     "TEXT"),
-            ("shopify_category",       "TEXT"),
-            ("shopify_category_id",    "TEXT"),
+            ("lot_number", "VARCHAR(255) NULL"), ("source_url", "TEXT NULL"),
+            ("colours_json", "LONGTEXT NOT NULL"), ("updated_at", "VARCHAR(40) NOT NULL DEFAULT ''"),
+            ("osp", "DOUBLE NULL"), ("capacity", "INT NULL"), ("capacity_unit", "VARCHAR(32) NULL"),
+            ("amazon_asin", "VARCHAR(64) NULL"), ("amazon_title", "TEXT NULL"), ("amazon_price", "TEXT NULL"),
+            ("amazon_rating", "VARCHAR(64) NULL"), ("amazon_reviews", "VARCHAR(64) NULL"),
+            ("amazon_availability", "TEXT NULL"), ("description", "LONGTEXT NULL"),
+            ("amazon_about_this_item", "LONGTEXT NULL"), ("specifications_json", "LONGTEXT NOT NULL"),
+            ("images_json", "LONGTEXT NOT NULL"), ("sub_category_id", "BIGINT NULL"),
+            ("created_by", "VARCHAR(255) NULL"), ("modified_by", "VARCHAR(255) NULL"),
+            ("whats_in_the_box", "LONGTEXT NULL"), ("weight_grams", "DOUBLE NULL"),
+            ("weight_unit", "VARCHAR(32) NULL"), ("packed_length", "DOUBLE NULL"),
+            ("packed_width", "DOUBLE NULL"), ("packed_height", "DOUBLE NULL"),
+            ("shopify_status", "VARCHAR(32) NULL"), ("shopify_pushed_at", "VARCHAR(40) NULL"),
+            ("shopify_synced_qty", "INT NOT NULL DEFAULT 0"), ("variant_image", "TEXT NULL"),
+            ("product_handle", "VARCHAR(255) NULL"), ("hs_code", "VARCHAR(32) NULL"),
+            ("warehouse_location", "VARCHAR(255) NULL"), ("shopify_category", "VARCHAR(255) NULL"),
+            ("shopify_category_id", "VARCHAR(255) NULL"),
         ]:
             if col not in inv_cols:
                 c.execute(f"ALTER TABLE inventory ADD COLUMN {col} {defn}")
 
         # Add created_by / modified_by to all other tables
         for table in ("users", "categories", "sub_categories", "brands", "grades", "colours", "abbreviations"):
-            existing = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+            existing = _table_columns(c, table)
             for col in ("created_by", "modified_by"):
                 if col not in existing:
-                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} VARCHAR(255) NULL")
 
         # Add created_by to audit_log
-        al_cols = {r["name"] for r in c.execute("PRAGMA table_info(audit_log)")}
+        al_cols = _table_columns(c, "audit_log")
         if "created_by" not in al_cols:
-            c.execute("ALTER TABLE audit_log ADD COLUMN created_by TEXT")
+            c.execute("ALTER TABLE audit_log ADD COLUMN created_by VARCHAR(255) NULL")
 
         # Backfill NULL codes for master data that pre-dates the mandatory-code rule
         c.execute("UPDATE categories SET code=UPPER(SUBSTR(REPLACE(name,' ',''),1,8)) WHERE code IS NULL OR code=''")
@@ -175,10 +237,9 @@ def init_db():
         # ── v6: rename single-letter grades to full names (Fresh unchanged) ──────
         if prev_version < 6:
             for _short, _full in (("A", "Grade A"), ("B", "Grade B")):
-                c.execute(
-                    "UPDATE grades SET name=? WHERE name=? COLLATE NOCASE "
-                    "AND NOT EXISTS (SELECT 1 FROM grades WHERE name=? COLLATE NOCASE)",
-                    (_full, _short, _full))
+                has_full = c.execute("SELECT 1 FROM grades WHERE name=?", (_full,)).fetchone()
+                if not has_full:
+                    c.execute("UPDATE grades SET name=? WHERE name=?", (_full, _short))
 
         c.execute("UPDATE schema_version SET version=6")
 
@@ -254,14 +315,21 @@ def _hash_password(password):
         raise ValueError("Password must be at least 10 characters.")
     salt = os.urandom(16)
     digest = scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=64)
-    return "scrypt$" + salt.hex() + "$" + digest.hex()
+    enc = lambda value: base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+    return "scryptb64$" + enc(salt) + "$" + enc(digest)
 
 def _verify_password(password, stored):
     try:
         algo, salt, expected = stored.split("$")
-        if algo != "scrypt": return False
-        got = scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1, dklen=64)
-        return hmac.compare_digest(got.hex(), expected)
+        if algo == "scryptb64":
+            decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+            salt_bytes, expected_bytes = decode(salt), decode(expected)
+        elif algo == "scrypt":
+            salt_bytes, expected_bytes = bytes.fromhex(salt), bytes.fromhex(expected)
+        else:
+            return False
+        got = scrypt(password.encode(), salt=salt_bytes, n=2**14, r=8, p=1, dklen=len(expected_bytes))
+        return hmac.compare_digest(got, expected_bytes)
     except Exception:
         return False
 
@@ -287,11 +355,11 @@ def create_initial_admin(username, password):
         if c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
             raise ValueError("An administrator already exists.")
         t = now()
-        c.execute(
+        cur = c.execute(
             "INSERT INTO users(username,password_hash,role,active,created_at,updated_at,created_by) VALUES(?,?,'admin',1,?,?,?)",
             (username.strip(), _hash_password(password), t, t, "system"))
         _audit(c, {"id": None, "username": username.strip()}, "user",
-               c.execute("SELECT last_insert_rowid()").fetchone()[0],
+               cur.lastrowid,
                "create_admin", new={"username": username.strip(), "role": "admin"})
 
 def authenticate(username, password):
