@@ -604,6 +604,24 @@ def get_inventory_by_id(row_id):
         if not row: raise ValueError("Inventory record not found.")
         return dict(row)
 
+def update_variant_details(row_id, changes, actor):
+    """Update stock and commercial details for one inventory variant."""
+    allowed = ("quantity", "mrp", "purchase_price", "selling_price", "osp", "lot_number", "variant_image")
+    with get_conn() as c:
+        row = c.execute("SELECT * FROM inventory WHERE id=?", (row_id,)).fetchone()
+        if not row:
+            raise ValueError("Inventory record not found.")
+        old = dict(row)
+        vals = {key: changes.get(key, row[key]) for key in allowed}
+        if int(vals["quantity"]) < 0:
+            raise ValueError("Quantity cannot be negative.")
+        status = "modified" if row["shopify_status"] == "synced" else row["shopify_status"]
+        c.execute("""UPDATE inventory SET quantity=?,mrp=?,purchase_price=?,selling_price=?,osp=?,
+                     lot_number=?,variant_image=?,shopify_status=?,updated_at=?,modified_by=? WHERE id=?""",
+                  (int(vals["quantity"]), vals["mrp"], vals["purchase_price"], vals["selling_price"],
+                   vals["osp"], vals["lot_number"], vals["variant_image"], status, now(), _actor_name(actor), row_id))
+        _audit(c, actor, "inventory", row_id, "update_variant_details", old=old, new=vals)
+
 def get_product_by_handle(product_handle):
     """Return the first existing inventory row for a product handle (product-level
     content is shared across its variants), or None if the product is new."""

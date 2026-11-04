@@ -6,11 +6,17 @@ import re
 import io as _io
 import uuid
 import hashlib
+# Streamlit may rerun this script while retaining imported modules in
+# sys.modules. Reload the local database module so newly added helpers are
+# available on reruns and after an in-place app update.
+import importlib
+import db as _db_module
+importlib.reload(_db_module)
 from db import (
     init_db, authenticate, create_user, list_users, set_user_active,
     list_master, add_master, bulk_add_master, bulk_add_sub_categories, update_master,
     list_inventory, preview_variants, save_inventory_variants,
-    update_inventory, get_inventory_by_id, get_product_by_handle, audit_rows,
+    update_inventory, update_variant_details, get_inventory_by_id, get_product_by_handle, audit_rows,
     change_password, admin_count, deactivate_master, inventory_suggestions,
     list_sub_categories, update_shopify_status, update_product_content, mark_synced,
     list_taxonomy_leaves, taxonomy_count, replace_taxonomy, search_taxonomy,
@@ -1058,6 +1064,40 @@ elif page == "Inventory":
                 "modified_by":    st.column_config.TextColumn("Modified By"),
                 "updated_at":     st.column_config.DatetimeColumn("Last Updated", format="DD MMM YYYY"),
             })
+
+            st.markdown("#### Edit variant details")
+            _variant_rows = var_src.to_dict("records")
+            _variant_labels = [f"{r.get('sku','')} · {r.get('grade') or 'No grade'} · {_colours(r.get('colours_json')) or 'No colour'} (ID {r['id']})" for r in _variant_rows]
+            _variant_by_label = dict(zip(_variant_labels, _variant_rows))
+            _picked = st.selectbox("Variant", _variant_labels, key="inv_edit_variant_select")
+            _vr = _variant_by_label[_picked]
+            def _num_or_zero(value):
+                return int(value) if pd.notna(value) and value is not None else 0
+            def _money_or_zero(value):
+                return float(value) if pd.notna(value) and value is not None else 0.0
+            with st.form(f"edit_variant_{_vr['id']}"):
+                st.caption(f"Editing SKU `{_vr.get('sku','')}`. Changes apply only to this variant.")
+                _e1, _e2, _e3 = st.columns(3)
+                _qty = _e1.number_input("Quantity", min_value=0, step=1, value=_num_or_zero(_vr.get("quantity")))
+                _mrp = _e2.number_input("MRP (₹)", min_value=0.0, step=100.0, value=_money_or_zero(_vr.get("mrp")))
+                _purchase = _e3.number_input("Purchase price (₹)", min_value=0.0, step=100.0, value=_money_or_zero(_vr.get("purchase_price")))
+                _e4, _e5, _e6 = st.columns(3)
+                _selling = _e4.number_input("Selling price (₹)", min_value=0.0, step=100.0, value=_money_or_zero(_vr.get("selling_price")))
+                _osp = _e5.number_input("OSP (₹)", min_value=0.0, step=100.0, value=_money_or_zero(_vr.get("osp")))
+                _lot = _e6.text_input("Lot number", value=str(_vr.get("lot_number") or ""))
+                _variant_image = st.text_input("Variant image URL", value=str(_vr.get("variant_image") or ""))
+                _save_variant = st.form_submit_button("Save variant details", type="primary")
+            if _save_variant:
+                try:
+                    update_variant_details(int(_vr["id"]), {
+                        "quantity": int(_qty), "mrp": _mrp or None, "purchase_price": _purchase or None,
+                        "selling_price": _selling or None, "osp": _osp or None, "lot_number": _lot.strip() or None,
+                        "variant_image": _variant_image.strip(),
+                    }, user)
+                    st.success("Variant details updated.")
+                    rerun()
+                except Exception as e:
+                    st.error(str(e))
 
         if is_admin():
             sec("EDIT PRODUCT CONTENT")
