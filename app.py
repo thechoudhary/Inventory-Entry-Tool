@@ -168,7 +168,7 @@ def _sync_taxonomy_from_dataset():
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _taxonomy_options():
+def _taxonomy_options(_taxonomy_revision=None):
     """Cached dropdown options for the Shopify category field — ONE entry per
     unique last-node name. Returns (names_sorted, {name: (gid, full_name)}).
     Duplicate leaf names collapse to the shortest (most general) full path."""
@@ -1239,7 +1239,9 @@ elif page == "Add Inventory":
     if taxonomy_count() == 0:
         st.warning("Shopify taxonomy isn't synced yet — an admin can sync it in **Manage → Shopify Taxonomy**.")
     else:
-        _names, _name_map = _taxonomy_options()
+        # Include the current row count in Streamlit's cache key so taxonomy
+        # entries added directly to the local database appear on the next rerun.
+        _names, _name_map = _taxonomy_options(taxonomy_count())
         _TAX_PLACEHOLDER = "— Select Shopify category * —"
         _sel = st.selectbox("Shopify Category (last node) *", [_TAX_PLACEHOLDER] + _names,
                             key=f"shopcat_{fc}",
