@@ -142,41 +142,16 @@ async def extract_amazon_product(product_url, proxy_api_key=None):
 
     async with async_playwright() as p:
 
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--disable-extensions",
-                "--window-size=1440,1000",
-            ],
-        )
+        browser = await p.chromium.launch(headless=True)
 
-        context_kwargs = dict(
-            locale="en-IN",
-            viewport={"width": 1440, "height": 1000},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            ignore_https_errors=True,
-        )
+        context_kwargs = {
+            "locale": "en-IN",
+            "viewport": {"width": 1440, "height": 1000},
+        }
         if proxy:
             context_kwargs["proxy"] = proxy
 
         context = await browser.new_context(**context_kwargs)
-
-        # Remove headless/automation signals that Amazon detects
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
-            window.chrome = { runtime: {} };
-        """)
-
         page = await context.new_page()
 
         try:
@@ -186,9 +161,10 @@ async def extract_amazon_product(product_url, proxy_api_key=None):
                 timeout=30000,
             )
 
-            # Check for bot/CAPTCHA immediately — before any waits.
-            # If Amazon blocked us the page loads instantly with a CAPTCHA title;
-            # detecting it here avoids wasting 8 s on wait_for_selector.
+            # Give Amazon's product page a moment to finish rendering, as in the
+            # working local notebook. Do not classify the generic "amazon.in"
+            # title alone as a block; redirects and transient pages can use it.
+            await page.wait_for_timeout(3000)
             page_title = (await page.title()).lower()
             current_url = page.url
             logger.info("HTTP status: %s | title: %s | url: %s",
@@ -200,7 +176,6 @@ async def extract_amazon_product(product_url, proxy_api_key=None):
                 or "/errors/validatecaptcha" in current_url
                 or "api-services" in current_url
                 or "auth-redirect" in current_url
-                or page_title in ("", "amazon.in")
             ):
                 msg = f"Amazon returned a bot/access check (title='{page_title}', url={current_url}) — could not fetch product details."
                 logger.warning(msg)

@@ -38,6 +38,7 @@ shopify_access_token.ipynb
 playwright-report/
 test-results/
 static/
+
 # Logs & temp
 *.log
 *.tmp
