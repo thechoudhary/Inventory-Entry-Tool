@@ -18,6 +18,11 @@ streamlit run app.py
 
 Open the local URL shown by Streamlit (normally `http://localhost:8501`).
 
+## Windows launcher
+On a Windows computer with Python 3.10+ installed, open the project folder and run `build_windows.bat`. It creates `dist\InventoryEntry.exe`. Copy that EXE into the project folder beside `app.py`, `requirements.txt`, and `.streamlit`; launch it to set up the environment and dependencies on first use, start the app, and open it in your browser. Keep the console window open while using the app; close it to stop the server.
+
+Configure `.streamlit\secrets.toml` before launching, following the database instructions below. The launcher needs an internet connection on first launch to install Python dependencies.
+
 ## First-use checklist
 1. Sign in with the administrator created by `setup_admin.py`.
 2. Open **Manage** and add categories, brands, grades (if needed), colours and abbreviations.
@@ -32,7 +37,20 @@ The current configurable pattern is `CATEGORY-BRAND-MODEL-COLOUR-GRADE`. Categor
 For multiple selected colours, this app creates one inventory record and one SKU. Selected colours are sorted alphabetically by colour name and their configured codes are concatenated into one colour segment (for example, Blue=BLU and Red=RED gives `BLURED`). Quantity applies to the combined-colour product record.
 
 ## Database
-SQLite is stored in `inventory.db` beside the application by default. To use a different persistent location, set `INVENTORY_DB_PATH` before launching the app. Keep this file backed up and private. Startup uses non-destructive schema checks; do not delete the database to upgrade.
+The app uses the MySQL database configured in `.streamlit/secrets.toml`. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, then set the RDS database name and password:
+
+```toml
+[mysql]
+host = "inventory-db.c7g2sq0e88r0.ap-southeast-2.rds.amazonaws.com"
+port = 3306
+database = "inventory" # Must already exist in the RDS instance.
+username = "inventory_app"
+password = "your actual password"
+```
+
+The RDS security group must allow inbound MySQL traffic (port 3306) from the app host. Startup creates the application tables and applies non-destructive column migrations. Existing data in `inventory.db` is not copied automatically; export/import it separately before switching if it must be retained.
+
+If an admin account already exists but its password hash came from an earlier MySQL build, reset it with `python setup_admin.py --reset-password admin` and follow the prompts. Password hashes now use a compact encoding that fits the MySQL column.
 
 ## Important limitations
 - Standard users can view and add inventory. Editing existing records, master data, user management and audit history are admin-only.
